@@ -2368,6 +2368,7 @@ def training_log(
     skipped_iter,
     grad_norm,
     params_norm,
+    params_norm_by_param,
     num_zeros_in_grad,
     max_attention_logit,
     pg_collection=None,
@@ -2514,6 +2515,12 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
+        if params_norm_by_param is not None:
+            for pname, pn in params_norm_by_param:
+                writer.add_scalar(f'params-norm-by-param/{pname}', pn, iteration)
+                writer.add_scalar(f'params-norm-by-param vs samples/{pname}', pn, args.consumed_train_samples)
+                if wandb_writer:
+                    wandb_writer.log({f'params-norm-by-param/{pname}': pn}, iteration)
         if args.perform_rl_step:
             grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
@@ -3649,9 +3656,12 @@ def train(
         else:
             loss_scale = 1.0
         params_norm = None
+        params_norm_by_param = None
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
+        if args.log_params_norm_by_param and iteration % args.tensorboard_log_interval == 0:
+            params_norm_by_param = calc_params_l2_norm(model, by_param=True)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
@@ -3666,6 +3676,7 @@ def train(
             skipped_iter,
             grad_norm,
             params_norm,
+            params_norm_by_param,
             num_zeros_in_grad,
             max_attention_logit,
             pg_collection=model_pg_collection,

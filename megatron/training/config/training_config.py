@@ -251,6 +251,11 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
+    log_params_norm_by_param: bool = False
+    """If set, calculate and log the l2 norm of each parameter separately (keyed by parameter
+    name) to TensorBoard. Not supported with expert parallelism or Megatron
+    FSDP."""
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 

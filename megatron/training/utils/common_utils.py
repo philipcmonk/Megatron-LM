@@ -48,15 +48,75 @@ from megatron.core.utils import (
 from megatron.core.transformer.module import param_is_not_shared
 
 
-def calc_params_l2_norm(model, force_create_fp32_copy=False):
-    """Calculate l2 norm of parameters"""
+# Cache for the canonical {param_name: index} map used by calc_params_l2_norm(by_param=True).
+# Built once, lazily, via a collective gather of parameter names across all ranks.
+_PARAM_NAME_TO_INDEX = None
+
+
+def _get_param_name_to_index(model):
+    """Build (once, cached) a canonical {param_name: index} map shared by all ranks.
+
+    Each rank only constructs its own shard of the model, so under pipeline parallelism
+    the parameter names are partitioned across ranks. We gather names from every rank and
+    build a single sorted, globally-consistent index map so that per-parameter norm buffers
+    line up across ranks for all-reduce. Parameter values don't change shape during a run,
+    so the map is built once and cached.
+    """
+    global _PARAM_NAME_TO_INDEX
+    if _PARAM_NAME_TO_INDEX is not None:
+        return _PARAM_NAME_TO_INDEX
+
+    local_names = [
+        name
+        for model_chunk in model
+        for name, _ in unwrap_model(model_chunk).named_parameters()
+    ]
+    gathered_names = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered_names, local_names)
+
+    all_names = set()
+    for names in gathered_names:
+        all_names.update(names)
+    # sorted() yields a deterministic ordering identical on every rank.
+    _PARAM_NAME_TO_INDEX = {name: idx for idx, name in enumerate(sorted(all_names))}
+    return _PARAM_NAME_TO_INDEX
+
+
+def calc_params_l2_norm(model, force_create_fp32_copy=False, by_param=False):
+    """Calculate l2 norm of parameters.
+
+    If ``by_param`` is False (default), returns the aggregate l2 norm as a scalar float.
+
+    If ``by_param`` is True, returns a list of ``(parameter_name, l2_norm)`` tuples. The
+    per-parameter norms are reduced across the same process groups as the aggregate norm,
+    so the result is correct for arbitrary tensor/pipeline/data parallelism (including the
+    distributed optimizer). Post-process the returned list to aggregate by layer, parameter
+    type, etc.
+
+    Expert parallelism: expert params are named by *local* expert index, which collides
+    across expert-parallel ranks. With ``--moe-grouped-gemm`` each rank's experts are stacked
+    into a single tensor, so the collision is benign -- disjoint experts summed over the
+    expert-parallel reduce group give a correct aggregate norm. Sequential experts collide on
+    distinct global experts and are not supported here (see the asserts below).
+    """
     args = get_args()
     if not isinstance(model, list):
         model = [model]
 
+    if by_param and getattr(args, 'expert_model_parallel_size', 1) > 1:
+        assert getattr(args, 'moe_grouped_gemm', False), (
+            "calc_params_l2_norm(by_param=True) with expert parallelism is only supported with "
+            "--moe-grouped-gemm; sequential experts collide on local expert names across "
+            "expert-parallel ranks."
+        )
+
     if getattr(args, 'use_megatron_fsdp', False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
         # params_data is a dict of device_mesh -> list of local tensors.
+        if by_param:
+            raise RuntimeError(
+                "calc_params_l2_norm(by_param=True) is not implemented for --use-megatron-fsdp"
+            )
         params = []
         for model_chunk in model:
             model_chunk.stop_communication()
@@ -74,10 +134,20 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     params_data = []
     moe_params_data = []
     sharded_params_data = []
+    # Parallel lists of parameter names, kept in lock-step with the *_params_data lists
+    # above. Only populated/used when by_param=True.
+    params_data_names = []
+    moe_params_data_names = []
+    sharded_params_data_names = []
+    # Tracks whether any expert (allreduce=False) param has a distributed-optimizer-sharded
+    # main param. Such params are reduced over the dense DP/CP and model-parallel groups
+    # (mirroring the scalar path), neither of which spans the expert-parallel group -- so the
+    # per-param result would silently drop other EP ranks' experts. Guarded below.
+    sharded_expert_params_present = False
     data_parallel_group = None
 
     for model_chunk in model:
-        for param in model_chunk.parameters():
+        for name, param in unwrap_model(model_chunk).named_parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
             is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
             if not is_not_tp_duplicate:
@@ -89,16 +159,21 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                 if args.bf16:
                     if not force_create_fp32_copy and hasattr(param, 'main_param'):
                         if getattr(param, 'main_param_sharded', False):
+                            sharded_expert_params_present = True
                             if param.main_param is not None:
                                 sharded_params_data.append(param.main_param)
+                                sharded_params_data_names.append(name)
                         else:
                             moe_params_data.append(param.main_param)
+                            moe_params_data_names.append(name)
                     else:
                         # Fallback to original logic of making a fp32 copy of the
                         # parameter if `.main_param` attribute is not available.
                         moe_params_data.append(param.data.float())
+                        moe_params_data_names.append(name)
                 else:
                     moe_params_data.append(param.data)
+                    moe_params_data_names.append(name)
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
@@ -107,14 +182,39 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                             if getattr(param, 'main_param_sharded', False):
                                 if param.main_param is not None:
                                     sharded_params_data.append(param.main_param)
+                                    sharded_params_data_names.append(name)
                             else:
                                 params_data.append(param.main_param)
+                                params_data_names.append(name)
                         else:
                             # Fallback to original logic of making a fp32 copy of the
                             # parameter if `.main_param` attribute is not available.
                             params_data.append(param.data.float())
+                            params_data_names.append(name)
                     else:
                         params_data.append(param.data)
+                        params_data_names.append(name)
+
+    if by_param:
+        assert not (
+            sharded_expert_params_present
+            and getattr(args, 'expert_model_parallel_size', 1) > 1
+        ), (
+            "calc_params_l2_norm(by_param=True) does not yet support distributed-optimizer-"
+            "sharded expert main params under expert parallelism: they are reduced over the "
+            "dense (non-expert-parallel) groups, which would drop other EP ranks' experts. "
+            "Route them over the expert-DP / expert-model-parallel groups to support this."
+        )
+        return _calc_params_l2_norm_by_param(
+            model,
+            params_data,
+            params_data_names,
+            sharded_params_data,
+            sharded_params_data_names,
+            moe_params_data,
+            moe_params_data_names,
+            data_parallel_group,
+        )
 
     # Calculate norm.
     dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
@@ -195,6 +295,81 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         norm_2 += moe_norm_2
 
     return norm_2.item() ** 0.5
+
+
+def _calc_params_l2_norm_by_param(
+    model,
+    params_data,
+    params_data_names,
+    sharded_params_data,
+    sharded_params_data_names,
+    moe_params_data,
+    moe_params_data_names,
+    data_parallel_group,
+):
+    """Per-parameter variant of calc_params_l2_norm.
+
+    Computes the squared l2 norm of every parameter into a fixed-size buffer (indexed by a
+    canonical, globally-consistent name->index map), then reduces those buffers across exactly
+    the same process groups as the scalar path -- one buffer per bucket, so replicated and
+    sharded params are handled correctly. Returns a list of (name, l2_norm) tuples.
+    """
+    name_to_index = _get_param_name_to_index(model)
+    num_params = len(name_to_index)
+
+    def fill_buffer(tensors, names):
+        # Zero-initialized full-model buffer; we only write the indices this rank owns (after
+        # the tp-duplicate / sharing filters). Because the buffer is zero-padded, a SUM
+        # all-reduce over a group spanning pipeline stages safely assembles disjoint params,
+        # and a SUM over the tensor-parallel group sums shards / counts replicas once.
+        buffer = torch.zeros(num_params, dtype=torch.float32, device='cuda')
+        for tensor, name in zip(tensors, names):
+            buffer[name_to_index[name]] = tensor.float().pow(2).sum()
+        return buffer
+
+    norm_2 = fill_buffer(params_data, params_data_names)
+    sharded_norm_2 = fill_buffer(sharded_params_data, sharded_params_data_names)
+    moe_norm_2 = fill_buffer(moe_params_data, moe_params_data_names)
+
+    # Replicated (non-sharded) params already hold their full value on each rank, so they are
+    # only reduced over DP when they are DTensor-sharded across it (mirrors the scalar path).
+    if data_parallel_group is not None:
+        torch.distributed.all_reduce(
+            norm_2, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+        )
+
+    # Distributed-optimizer-sharded main params: reassemble across DP+CP.
+    torch.distributed.all_reduce(
+        sharded_norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_data_parallel_group(with_context_parallel=True),
+    )
+    norm_2 += sharded_norm_2
+
+    # Reduce across model parallel groups (dense and expert), exactly as the scalar path does.
+    dense_reduce_group = mpu.get_model_parallel_group()
+    ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
+    expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+    ranks_in_expert_reduce_group = torch.distributed.get_process_group_ranks(expert_reduce_group)
+
+    if ranks_in_dense_reduce_group == ranks_in_expert_reduce_group:
+        norm_2 += moe_norm_2
+        torch.distributed.all_reduce(
+            norm_2, op=torch.distributed.ReduceOp.SUM, group=dense_reduce_group
+        )
+    else:
+        torch.distributed.all_reduce(
+            norm_2, op=torch.distributed.ReduceOp.SUM, group=dense_reduce_group
+        )
+        torch.distributed.all_reduce(
+            moe_norm_2, op=torch.distributed.ReduceOp.SUM, group=expert_reduce_group
+        )
+        norm_2 += moe_norm_2
+
+    # One device->host sync for the whole buffer, then map back to names.
+    norms = norm_2.sqrt().tolist()
+    index_to_name = sorted(name_to_index, key=name_to_index.get)
+    return [(name, norms[idx]) for idx, name in enumerate(index_to_name)]
 
 
 def calc_dtensor_params_l2_norm(params):
