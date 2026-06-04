@@ -323,8 +323,17 @@ def _calc_params_l2_norm_by_param(
         # all-reduce over a group spanning pipeline stages safely assembles disjoint params,
         # and a SUM over the tensor-parallel group sums shards / counts replicas once.
         buffer = torch.zeros(num_params, dtype=torch.float32, device='cuda')
-        for tensor, name in zip(tensors, names):
-            buffer[name_to_index[name]] = tensor.float().pow(2).sum()
+        if tensors:
+            idx = torch.tensor([name_to_index[name] for name in names], device='cuda')
+            dummy_overflow_buf = torch.zeros((1,), dtype=torch.int, device='cuda')
+            _, per_tensor_norm = multi_tensor_applier(
+                multi_tensor_l2norm, dummy_overflow_buf, [tensors], True  # per-parameter norm.
+            )
+            if per_tensor_norm is not None and per_tensor_norm.numel() == len(tensors):
+                buffer[idx] = per_tensor_norm.to(torch.float32) ** 2
+            else:
+                # Local fallback impl doesn't return per-tensor norms; compute accurately.
+                buffer[idx] = torch.stack([tensor.float().pow(2).sum() for tensor in tensors])
         return buffer
 
     norm_2 = fill_buffer(params_data, params_data_names)
