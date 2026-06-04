@@ -2516,11 +2516,34 @@ def training_log(
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
         if params_norm_by_param is not None:
-            for pname, pn in params_norm_by_param:
-                writer.add_scalar(f'params-norm-by-param/{pname}', pn, iteration)
-                writer.add_scalar(f'params-norm-by-param vs samples/{pname}', pn, args.consumed_train_samples)
-                if wandb_writer:
-                    wandb_writer.log({f'params-norm-by-param/{pname}': pn}, iteration)
+            # Batch all per-parameter scalars into a single TensorBoard event per step,
+            # since the writer serializes these.
+            try:
+                from tensorboard.compat.proto.summary_pb2 import Summary
+                file_writer = writer._get_file_writer()
+                for tag_prefix, step in (
+                    ('params-norm-by-param', iteration),
+                    ('params-norm-by-param vs samples', args.consumed_train_samples),
+                ):
+                    file_writer.add_summary(
+                        Summary(value=[
+                            Summary.Value(tag=f'{tag_prefix}/{pname}', simple_value=float(pn))
+                            for pname, pn in params_norm_by_param
+                        ]),
+                        global_step=step,
+                    )
+            except (AttributeError, ImportError):
+                # Fall back to per-scalar writes if the batched API is unavailable.
+                for pname, pn in params_norm_by_param:
+                    writer.add_scalar(f'params-norm-by-param/{pname}', pn, iteration)
+                    writer.add_scalar(
+                        f'params-norm-by-param vs samples/{pname}', pn, args.consumed_train_samples
+                    )
+            if wandb_writer:
+                wandb_writer.log(
+                    {f'params-norm-by-param/{pname}': pn for pname, pn in params_norm_by_param},
+                    iteration,
+                )
         if args.perform_rl_step:
             grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
