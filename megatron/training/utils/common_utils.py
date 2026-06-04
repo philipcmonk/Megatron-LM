@@ -52,6 +52,11 @@ from megatron.core.transformer.module import param_is_not_shared
 # Built once, lazily, via a collective gather of parameter names across all ranks.
 _PARAM_NAME_TO_INDEX = None
 
+# Relative tolerance for the by_param self-check: the per-parameter norms, recombined into an
+# aggregate, must match the independently-computed scalar norm to within this much. Float-noise
+# differences between the two paths are ~1e-7.
+_BY_PARAM_NORM_RTOL = 1e-2
+
 
 def _get_param_name_to_index(model):
     """Build (once, cached) a canonical {param_name: index} map shared by all ranks.
@@ -205,7 +210,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False, by_param=False):
             "dense (non-expert-parallel) groups, which would drop other EP ranks' experts. "
             "Route them over the expert-DP / expert-model-parallel groups to support this."
         )
-        return _calc_params_l2_norm_by_param(
+        per_param_result, reconstructed_norm = _calc_params_l2_norm_by_param(
             model,
             params_data,
             params_data_names,
@@ -294,7 +299,23 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False, by_param=False):
         )
         norm_2 += moe_norm_2
 
-    return norm_2.item() ** 0.5
+    scalar_norm = norm_2.item() ** 0.5
+
+    if by_param:
+        # Self-check: the per-parameter norms, recombined, should equal the scalar norm. A
+        # large discrepancy means the per-param reduction mishandled this parallelism config.
+        rel_diff = abs(reconstructed_norm - scalar_norm) / scalar_norm if scalar_norm > 0 else 0.0
+        if rel_diff > _BY_PARAM_NORM_RTOL:
+            warn_rank_0(
+                "calc_params_l2_norm(by_param=True): per-parameter norms recombine to an "
+                f"aggregate of {reconstructed_norm:.6e}, but the directly-computed norm is "
+                f"{scalar_norm:.6e} (relative difference {rel_diff:.2e} > "
+                f"{_BY_PARAM_NORM_RTOL:.0e}). The per-parameter reduction is likely incorrect "
+                "for this parallelism configuration; treat the per-parameter norms with caution."
+            )
+        return per_param_result
+
+    return scalar_norm
 
 
 def _calc_params_l2_norm_by_param(
@@ -375,10 +396,13 @@ def _calc_params_l2_norm_by_param(
         )
         norm_2 += moe_norm_2
 
+    # Aggregate norm reconstructed from the per-parameter squared norms, returned so the caller
+    # can validate it against the independently-computed scalar norm.
+    reconstructed_norm = float(norm_2.sum().sqrt())
     # One device->host sync for the whole buffer, then map back to names.
     norms = norm_2.sqrt().tolist()
     index_to_name = sorted(name_to_index, key=name_to_index.get)
-    return [(name, norms[idx]) for idx, name in enumerate(index_to_name)]
+    return [(name, norms[idx]) for idx, name in enumerate(index_to_name)], reconstructed_norm
 
 
 def calc_dtensor_params_l2_norm(params):
