@@ -253,8 +253,12 @@ class LoggerConfig:
 
     log_params_norm_by_param: bool = False
     """If set, calculate and log the l2 norm of each parameter separately (keyed by parameter
-    name) to TensorBoard. Not supported with expert parallelism or Megatron
-    FSDP."""
+    name) to JSONL statistics files. Uses the same parallelism support constraints as
+    calc_params_l2_norm(by_param=True)."""
+
+    statistics_log_dir: str | None = None
+    """Directory for high-cardinality JSONL statistics. If unset, statistics use
+    tensorboard_dir when available, then save as a fallback."""
 
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""

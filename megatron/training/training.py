@@ -66,6 +66,7 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
 
 _LEGACY_TRAIN_START_TIME = time.time() # NOTE(asolergi-nv): Legacy timestamp
+_STATS_LOG_DIR_WARNING_SHOWN = False
 
 import torch
 
@@ -253,6 +254,7 @@ from .activation_logging import (
 )
 from .async_utils import maybe_finalize_async_save
 from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
+from .statistics_logging import save_params_norm_by_param
 from .global_vars import (
     destroy_global_vars,
     get_args,
@@ -301,6 +303,39 @@ def print_datetime(string, override_timestamp=None):
     else:
         time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
+
+
+def _get_statistics_log_dir(args):
+    return (
+        getattr(args, 'statistics_log_dir', None)
+        or getattr(args, 'tensorboard_dir', None)
+        or getattr(args, 'save', None)
+    )
+
+
+def _should_write_global_training_stats(args):
+    rank = getattr(args, 'rank', None)
+    if rank is None:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    world_size = getattr(args, 'world_size', None)
+    if world_size is None:
+        world_size = (
+            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        )
+
+    return rank == world_size - 1
+
+
+def _warn_missing_statistics_log_dir():
+    global _STATS_LOG_DIR_WARNING_SHOWN
+    if not _STATS_LOG_DIR_WARNING_SHOWN:
+        print_rank_0(
+            "WARNING: --log-params-norm-by-param was set, but no statistics log directory "
+            "is available. Set --statistics-log-dir, --tensorboard-dir, or --save to write "
+            "high-cardinality JSONL statistics."
+        )
+        _STATS_LOG_DIR_WARNING_SHOWN = True
 
 # Per-iteration packed-sequence (THD) accumulator. The tensor holds TWO stats,
 # both computed from the REAL ``cu_seqlens`` (i.e. unpadded sub-sequence lengths
@@ -2368,7 +2403,6 @@ def training_log(
     skipped_iter,
     grad_norm,
     params_norm,
-    params_norm_by_param,
     num_zeros_in_grad,
     max_attention_logit,
     pg_collection=None,
@@ -2515,35 +2549,6 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if params_norm_by_param is not None:
-            # Batch all per-parameter scalars into a single TensorBoard event per step,
-            # since the writer serializes these.
-            try:
-                from tensorboard.compat.proto.summary_pb2 import Summary
-                file_writer = writer._get_file_writer()
-                for tag_prefix, step in (
-                    ('params-norm-by-param', iteration),
-                    ('params-norm-by-param vs samples', args.consumed_train_samples),
-                ):
-                    file_writer.add_summary(
-                        Summary(value=[
-                            Summary.Value(tag=f'{tag_prefix}/{pname}', simple_value=float(pn))
-                            for pname, pn in params_norm_by_param
-                        ]),
-                        global_step=step,
-                    )
-            except (AttributeError, ImportError):
-                # Fall back to per-scalar writes if the batched API is unavailable.
-                for pname, pn in params_norm_by_param:
-                    writer.add_scalar(f'params-norm-by-param/{pname}', pn, iteration)
-                    writer.add_scalar(
-                        f'params-norm-by-param vs samples/{pname}', pn, args.consumed_train_samples
-                    )
-            if wandb_writer:
-                wandb_writer.log(
-                    {f'params-norm-by-param/{pname}': pn for pname, pn in params_norm_by_param},
-                    iteration,
-                )
         if args.perform_rl_step:
             grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
@@ -3679,12 +3684,21 @@ def train(
         else:
             loss_scale = 1.0
         params_norm = None
-        params_norm_by_param = None
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
         if args.log_params_norm_by_param and iteration % args.tensorboard_log_interval == 0:
             params_norm_by_param = calc_params_l2_norm(model, by_param=True)
+            statistics_log_dir = _get_statistics_log_dir(args)
+            if statistics_log_dir is None:
+                _warn_missing_statistics_log_dir()
+            elif _should_write_global_training_stats(args):
+                save_params_norm_by_param(
+                    statistics_log_dir,
+                    iteration,
+                    args.consumed_train_samples,
+                    params_norm_by_param,
+                )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
@@ -3699,7 +3713,6 @@ def train(
             skipped_iter,
             grad_norm,
             params_norm,
-            params_norm_by_param,
             num_zeros_in_grad,
             max_attention_logit,
             pg_collection=model_pg_collection,
