@@ -46,13 +46,21 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
+from ..per_parameter_stats import (
+    NamedTensorBucket,
+    PerParameterStatRegistry,
+    get_or_create_per_parameter_stat_registry,
+    reduce_l2_norm_by_param,
+)
 from ..transformer.module import param_is_not_shared
-from ..utils import log_single_rank
+from ..utils import get_data_parallel_group_if_dtensor, log_single_rank, to_local_if_dtensor
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
+
+_GRAD_NORM_BY_PARAM_RTOL = 1e-2
 
 
 def _zero_grad_group_helper(
@@ -125,6 +133,9 @@ class MegatronOptimizer(ABC):
             )
         self.config = config
         self.init_state_fn = init_state_fn
+        self._per_param_grad_norm_requested = False
+        self._per_param_stat_registry = None
+        self._latest_grad_norm_by_param = None
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
@@ -136,6 +147,38 @@ class MegatronOptimizer(ABC):
                 for param in param_group['params']:
                     params.append(param)
         return params
+
+    def _get_grad_for_grad_norm(self, param: torch.nn.Parameter) -> torch.Tensor | None:
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
+            # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+            self.config.use_precision_aware_optimizer
+            and getattr(param, "__fsdp_param__", False)
+        ):
+            grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+            if (
+                getattr(param, "__fsdp_param__", False)
+                and grad is not None
+                and hasattr(grad, "_local_tensor")
+            ):
+                # Megatron-FSDP gradients are DTensors.
+                grad = grad._local_tensor
+        elif getattr(param, "__fsdp_param__", False):
+            # Megatron-FSDP gradients are DTensors.
+            grad = param.grad._local_tensor if param.grad is not None else None
+        else:
+            grad = param.grad
+        return grad
+
+    def _include_param_in_grad_norm(
+        self, param: torch.nn.Parameter, grad: torch.Tensor | None
+    ) -> bool:
+        return (
+            grad is not None
+            and param_is_not_shared(param)
+            and tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                param, getattr(self, 'tp_group', None)
+            )
+        )
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
         """Collects gradients for norm calculation, filtering duplicates.
@@ -150,33 +193,102 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
-                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
-                self.config.use_precision_aware_optimizer
-                and getattr(param, "__fsdp_param__", False)
-            ):
-                grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
-                if (
-                    getattr(param, "__fsdp_param__", False)
-                    and grad is not None
-                    and hasattr(grad, "_local_tensor")
-                ):
-                    # Megatron-FSDP gradients are DTensors.
-                    grad = grad._local_tensor
-            elif getattr(param, "__fsdp_param__", False):
-                # Megatron-FSDP gradients are DTensors.
-                grad = param.grad._local_tensor if param.grad is not None else None
-            else:
-                grad = param.grad
-            grad_not_none = grad is not None
-            is_not_shared = param_is_not_shared(param)
-            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-                param, getattr(self, 'tp_group', None)
-            )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            grad = self._get_grad_for_grad_norm(param)
+            if self._include_param_in_grad_norm(param, grad):
                 grads_for_norm.append(grad)
 
         return grads_for_norm
+
+    def _get_param_to_name_for_per_param_stats(
+        self, registry: PerParameterStatRegistry
+    ) -> dict[torch.nn.Parameter, str]:
+        param_to_name = {}
+        for model_param, name in registry.param_to_name.items():
+            param_to_name[model_param] = name
+            main_param = getattr(model_param, 'main_param', None)
+            if main_param is not None:
+                param_to_name[main_param] = name
+        return param_to_name
+
+    def get_named_parameters_for_grad_norm(
+        self, registry: PerParameterStatRegistry
+    ) -> list[tuple[str, torch.nn.Parameter]]:
+        param_to_name = self._get_param_to_name_for_per_param_stats(registry)
+        return [
+            (param_to_name[param], param)
+            for param in self.get_parameters()
+            if param in param_to_name
+        ]
+
+    def get_l2_norm_buckets_for_grad_norm(
+        self, registry: PerParameterStatRegistry
+    ) -> list[NamedTensorBucket]:
+        names = []
+        grads = []
+        data_parallel_group = None
+        for name, param in self.get_named_parameters_for_grad_norm(registry):
+            grad = self._get_grad_for_grad_norm(param)
+            if not self._include_param_in_grad_norm(param, grad):
+                continue
+            data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
+            names.append(name)
+            grads.append(to_local_if_dtensor(grad).detach())
+
+        reduce_groups = (
+            (data_parallel_group,) if data_parallel_group is not None else ()
+        ) + (self.get_grad_stats_parallel_group(),)
+        return [NamedTensorBucket(names, grads, reduce_groups)]
+
+    def get_grad_norm_by_param(
+        self, registry: PerParameterStatRegistry | None = None
+    ) -> tuple[list[tuple[str, float]], float]:
+        if registry is None:
+            registry = get_or_create_per_parameter_stat_registry(self.model_chunks)
+        return reduce_l2_norm_by_param(registry, self.get_l2_norm_buckets_for_grad_norm(registry))
+
+    def request_grad_norm_by_param(self, model_chunks: Any) -> None:
+        self._per_param_stat_registry = get_or_create_per_parameter_stat_registry(model_chunks)
+        self._per_param_grad_norm_requested = True
+        self._latest_grad_norm_by_param = None
+
+    def consume_grad_norm_by_param(self) -> list[tuple[str, float]] | None:
+        grad_norm_by_param = self._latest_grad_norm_by_param
+        self._latest_grad_norm_by_param = None
+        return grad_norm_by_param
+
+    def _clear_grad_norm_by_param_request(self) -> None:
+        self._per_param_grad_norm_requested = False
+        self._latest_grad_norm_by_param = None
+
+    def _maybe_record_grad_norm_by_param(
+        self, scalar_grad_norm: float | torch.Tensor | None = None
+    ) -> None:
+        if not self._per_param_grad_norm_requested:
+            return
+
+        grad_norm_by_param, reconstructed_norm = self.get_grad_norm_by_param(
+            self._per_param_stat_registry
+        )
+        self._latest_grad_norm_by_param = grad_norm_by_param
+        self._per_param_grad_norm_requested = False
+
+        if scalar_grad_norm is None:
+            return
+        if isinstance(scalar_grad_norm, torch.Tensor):
+            scalar_grad_norm = scalar_grad_norm.item()
+        scalar_grad_norm = float(scalar_grad_norm)
+        rel_diff = (
+            abs(reconstructed_norm - scalar_grad_norm) / scalar_grad_norm
+            if scalar_grad_norm > 0
+            else 0.0
+        )
+        if rel_diff > _GRAD_NORM_BY_PARAM_RTOL:
+            warnings.warn(
+                "per-parameter gradient norms recombine to an aggregate of "
+                f"{reconstructed_norm:.6e}, but the directly-computed gradient norm is "
+                f"{scalar_grad_norm:.6e} (relative difference {rel_diff:.2e} > "
+                f"{_GRAD_NORM_BY_PARAM_RTOL:.0e})."
+            )
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
@@ -227,6 +339,7 @@ class MegatronOptimizer(ABC):
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
+        self._maybe_record_grad_norm_by_param(grad_norm)
 
         if params:
             clip_grad_by_total_norm_fp32(
@@ -623,6 +736,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
+            self._clear_grad_norm_by_param_request()
             return False, None, None
 
         # Clip the main gradients.
@@ -633,6 +747,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         grad_norm = 0.0
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
+        elif self._per_param_grad_norm_requested:
+            grad_norm = self.get_grad_norm()
+            self._maybe_record_grad_norm_by_param(grad_norm)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -993,6 +1110,7 @@ class FP32Optimizer(MegatronOptimizer):
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
+            self._clear_grad_norm_by_param_request()
             return False, None, None
 
         # Clip gradients.
@@ -1003,6 +1121,9 @@ class FP32Optimizer(MegatronOptimizer):
         grad_norm = None
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
+        elif self._per_param_grad_norm_requested:
+            grad_norm = self.get_grad_norm()
+            self._maybe_record_grad_norm_by_param(grad_norm)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -1113,6 +1234,9 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def __init__(self, chained_optimizers: List[MegatronOptimizer]):
         self.model_chunks = []
+        self._per_param_grad_norm_requested = False
+        self._per_param_stat_registry = None
+        self._latest_grad_norm_by_param = None
         # chained_optimizers would be empty in the case that a rank
         # has no trainable parameters
         if chained_optimizers:
@@ -1389,6 +1513,14 @@ class ChainedOptimizer(MegatronOptimizer):
         )
         return self.chained_optimizers[0].get_grad_stats_parallel_group()
 
+    def get_l2_norm_buckets_for_grad_norm(
+        self, registry: PerParameterStatRegistry
+    ) -> list[NamedTensorBucket]:
+        buckets = []
+        for optimizer in self.chained_optimizers:
+            buckets.extend(optimizer.get_l2_norm_buckets_for_grad_norm(registry))
+        return buckets
+
     @torch.no_grad()
     def get_grad_norm(self):
         if len(self.chained_optimizers) == 1:
@@ -1437,9 +1569,11 @@ class ChainedOptimizer(MegatronOptimizer):
         """ChainedOptimizer will step all optimizers one by one."""
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
+            self._clear_grad_norm_by_param_request()
             return False, None, None
 
         grad_norm = self.get_grad_norm()
+        self._maybe_record_grad_norm_by_param(grad_norm)
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:

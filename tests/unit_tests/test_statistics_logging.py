@@ -2,7 +2,7 @@
 
 import json
 
-from megatron.training.statistics_logging import save_params_norm_by_param
+from megatron.training.statistics_logging import save_grad_norm_by_param, save_params_norm_by_param
 
 
 def _read_records(filepath):
@@ -74,3 +74,33 @@ class TestSaveParamsNormByParam:
 
         filepath = tmp_path / "training_stats" / "params_norm_by_param" / "rank0.jsonl"
         assert not filepath.exists()
+
+
+class TestSaveGradNormByParam:
+    def test_creates_jsonl(self, tmp_path):
+        save_grad_norm_by_param(
+            str(tmp_path),
+            iteration=100,
+            consumed_train_samples=8192,
+            grad_norm_by_param=[
+                ("decoder.layers.0.self_attention.linear_qkv.weight", 3.5),
+                ("decoder.layers.0.mlp.linear_fc1.weight", 4.25),
+            ],
+            rank=3,
+        )
+
+        filepath = tmp_path / "training_stats" / "grad_norm_by_param" / "rank3.jsonl"
+        records = _read_records(filepath)
+        assert records == [
+            {
+                "iter": 100,
+                "consumed_train_samples": 8192,
+                "stat": "grad_norm_by_param",
+                "norm_type": "l2",
+                "gradient_stage": "pre_clip",
+                "values": {
+                    "decoder.layers.0.self_attention.linear_qkv.weight": 3.5,
+                    "decoder.layers.0.mlp.linear_fc1.weight": 4.25,
+                },
+            }
+        ]

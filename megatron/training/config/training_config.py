@@ -256,6 +256,10 @@ class LoggerConfig:
     name) to JSONL statistics files. Uses the same parallelism support constraints as
     calc_params_l2_norm(by_param=True)."""
 
+    log_grad_norm_by_param: bool = False
+    """If set, calculate and log the pre-clipping l2 norm of each parameter's gradient
+    separately (keyed by parameter name) to JSONL statistics files."""
+
     statistics_log_dir: str | None = None
     """Directory for high-cardinality JSONL statistics. If unset, statistics use
     tensorboard_dir when available, then save as a fallback."""

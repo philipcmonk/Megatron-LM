@@ -254,7 +254,6 @@ from .activation_logging import (
 )
 from .async_utils import maybe_finalize_async_save
 from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
-from .statistics_logging import save_params_norm_by_param
 from .global_vars import (
     destroy_global_vars,
     get_args,
@@ -266,6 +265,7 @@ from .global_vars import (
     get_tokenizer,
     get_wandb_writer,
 )
+from .statistics_logging import save_grad_norm_by_param, save_params_norm_by_param
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
@@ -331,9 +331,9 @@ def _warn_missing_statistics_log_dir():
     global _STATS_LOG_DIR_WARNING_SHOWN
     if not _STATS_LOG_DIR_WARNING_SHOWN:
         print_rank_0(
-            "WARNING: --log-params-norm-by-param was set, but no statistics log directory "
-            "is available. Set --statistics-log-dir, --tensorboard-dir, or --save to write "
-            "high-cardinality JSONL statistics."
+            "WARNING: per-parameter statistics logging was requested, but no statistics log "
+            "directory is available. Set --statistics-log-dir, --tensorboard-dir, or --save "
+            "to write high-cardinality JSONL statistics."
         )
         _STATS_LOG_DIR_WARNING_SHOWN = True
 
@@ -2319,6 +2319,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    if (
+        optimizer is not None
+        and getattr(args, 'log_grad_norm_by_param', False)
+        and iteration is not None
+        and (iteration + 1) % args.tensorboard_log_interval == 0
+    ):
+        optimizer.request_grad_norm_by_param(model)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -3698,6 +3705,22 @@ def train(
                     iteration,
                     args.consumed_train_samples,
                     params_norm_by_param,
+                )
+        if (
+            getattr(args, 'log_grad_norm_by_param', False)
+            and iteration % args.tensorboard_log_interval == 0
+            and optimizer is not None
+        ):
+            grad_norm_by_param = optimizer.consume_grad_norm_by_param()
+            statistics_log_dir = _get_statistics_log_dir(args)
+            if statistics_log_dir is None:
+                _warn_missing_statistics_log_dir()
+            elif grad_norm_by_param is not None and _should_write_global_training_stats(args):
+                save_grad_norm_by_param(
+                    statistics_log_dir,
+                    iteration,
+                    args.consumed_train_samples,
+                    grad_norm_by_param,
                 )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
