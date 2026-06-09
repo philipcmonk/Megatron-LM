@@ -265,10 +265,11 @@ from .global_vars import (
     get_tokenizer,
     get_wandb_writer,
 )
-from .statistics_logging import save_grad_norm_by_param, save_params_norm_by_param
+from .statistics_logging import save_grad_raw_moments_by_param, save_param_raw_moments_by_param
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
+    calc_params_raw_moments_by_param,
     check_adlr_autoresume_termination,
     is_last_rank,
     logical_and_across_model_parallel_group,
@@ -2321,11 +2322,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if (
         optimizer is not None
-        and getattr(args, 'log_grad_norm_by_param', False)
+        and getattr(args, 'log_grad_raw_moments_by_param', False)
         and iteration is not None
         and (iteration + 1) % args.tensorboard_log_interval == 0
     ):
-        optimizer.request_grad_norm_by_param(model)
+        optimizer.request_grad_raw_moments_by_param(model)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -3694,33 +3695,39 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        if args.log_params_norm_by_param and iteration % args.tensorboard_log_interval == 0:
-            params_norm_by_param = calc_params_l2_norm(model, by_param=True)
+        if (
+            getattr(args, 'log_param_raw_moments_by_param', False)
+            and iteration % args.tensorboard_log_interval == 0
+        ):
+            param_raw_moments_by_param = calc_params_raw_moments_by_param(model)
             statistics_log_dir = _get_statistics_log_dir(args)
             if statistics_log_dir is None:
                 _warn_missing_statistics_log_dir()
             elif _should_write_global_training_stats(args):
-                save_params_norm_by_param(
+                save_param_raw_moments_by_param(
                     statistics_log_dir,
                     iteration,
                     args.consumed_train_samples,
-                    params_norm_by_param,
+                    param_raw_moments_by_param,
                 )
         if (
-            getattr(args, 'log_grad_norm_by_param', False)
+            getattr(args, 'log_grad_raw_moments_by_param', False)
             and iteration % args.tensorboard_log_interval == 0
             and optimizer is not None
         ):
-            grad_norm_by_param = optimizer.consume_grad_norm_by_param()
+            grad_raw_moments_by_param = optimizer.consume_grad_raw_moments_by_param()
             statistics_log_dir = _get_statistics_log_dir(args)
             if statistics_log_dir is None:
                 _warn_missing_statistics_log_dir()
-            elif grad_norm_by_param is not None and _should_write_global_training_stats(args):
-                save_grad_norm_by_param(
+            elif (
+                grad_raw_moments_by_param is not None
+                and _should_write_global_training_stats(args)
+            ):
+                save_grad_raw_moments_by_param(
                     statistics_log_dir,
                     iteration,
                     args.consumed_train_samples,
-                    grad_norm_by_param,
+                    grad_raw_moments_by_param,
                 )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)

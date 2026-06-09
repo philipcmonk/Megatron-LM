@@ -713,7 +713,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
         return grad_norm
 
-    def get_l2_norm_buckets_for_grad_norm(
+    def get_raw_moment_buckets_for_grad_norm(
         self, registry: PerParameterStatRegistry
     ) -> list[NamedTensorBucket]:
         names = []

@@ -13,22 +13,12 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.utils import unwrap_model
 
-try:
-    from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
-except ImportError:
-    try:
-        from amp_C import multi_tensor_l2norm
-        from apex.multi_tensor_apply import multi_tensor_applier
-    except ImportError:
-        from megatron.core.utils import (
-            local_multi_tensor_applier as multi_tensor_applier,
-            local_multi_tensor_l2_norm as multi_tensor_l2norm,
-        )
-
 
 _LAYER_NAME_PATTERN = re.compile(r"layers\.(\d+)")
 _GROUPED_EXPERT_PATTERN = re.compile(r"^(.*\.mlp\.experts\.linear_fc\d\.weight)(\d+)(.*)$")
 _SEQUENTIAL_EXPERT_PATTERN = re.compile(r"^(.*\.mlp\.experts\.local_experts\.)(\d+)(\..*)$")
+RAW_MOMENT_FIELDS = ("count", "sum_1", "sum_2", "sum_3", "sum_4")
+_RAW_MOMENTS_DTYPE = torch.float32
 
 
 @dataclass(frozen=True)
@@ -99,52 +89,58 @@ def get_or_create_per_parameter_stat_registry(
     return registry
 
 
-def reduce_l2_norm_by_param(
+def reduce_raw_moments_by_param(
     registry: PerParameterStatRegistry,
     buckets: Sequence[NamedTensorBucket],
-) -> tuple[list[tuple[str, float]], float]:
-    """Reduce named tensor L2 norms by parameter name.
+) -> tuple[list[tuple[str, dict[str, float]]], dict[str, float]]:
+    """Reduce named tensor raw moments by parameter name.
 
     Args:
         registry: Canonical parameter-name registry.
         buckets: Named tensor buckets with the process groups needed to assemble each bucket's
-            local squared norms into global per-parameter squared norms.
+            local raw moments into global per-parameter raw moments.
 
     Returns:
-        A ``(values, aggregate_norm)`` tuple. ``values`` is a list of ``(name, l2_norm)`` tuples
-        ordered by canonical parameter index. ``aggregate_norm`` is the L2 norm reconstructed
-        from the reduced per-parameter squared norms.
+        A ``(values, aggregate_moments)`` tuple. ``values`` is a list of
+        ``(name, raw_moment_dict)`` tuples ordered by canonical parameter index.
     """
     device = _select_device(buckets)
-    norm_2 = torch.zeros(registry.num_params, dtype=torch.float32, device=device)
+    moments = torch.zeros(
+        (registry.num_params, len(RAW_MOMENT_FIELDS)),
+        dtype=_RAW_MOMENTS_DTYPE,
+        device=device,
+    )
 
     for bucket in buckets:
         if len(bucket.names) != len(bucket.tensors):
             raise ValueError(
-                f"NamedTensorBucket has {len(bucket.names)} names but {len(bucket.tensors)} tensors."
+                f"NamedTensorBucket has {len(bucket.names)} names but "
+                f"{len(bucket.tensors)} tensors."
             )
 
-        bucket_norm_2 = torch.zeros_like(norm_2)
+        bucket_moments = torch.zeros_like(moments)
         if bucket.names:
             indices = torch.tensor(
                 [registry.name_to_index[name] for name in bucket.names],
                 dtype=torch.long,
                 device=device,
             )
-            per_tensor_norm_2 = _local_l2_norm_squared(bucket.tensors, device)
-            bucket_norm_2.index_add_(0, indices, per_tensor_norm_2)
+            bucket_moments.index_add_(0, indices, _local_raw_moments(bucket.tensors, device))
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             for group in bucket.reduce_groups:
                 torch.distributed.all_reduce(
-                    bucket_norm_2, op=torch.distributed.ReduceOp.SUM, group=group
+                    bucket_moments, op=torch.distributed.ReduceOp.SUM, group=group
                 )
 
-        norm_2 += bucket_norm_2
+        moments += bucket_moments
 
-    aggregate_norm = float(norm_2.sum().sqrt())
-    norms = norm_2.sqrt().tolist()
-    return [(name, norms[idx]) for idx, name in enumerate(registry.index_to_name)], aggregate_norm
+    rows = moments.tolist()
+    aggregate_moments = _raw_moment_row_to_dict(moments.sum(dim=0).tolist())
+    return [
+        (name, _raw_moment_row_to_dict(rows[idx]))
+        for idx, name in enumerate(registry.index_to_name)
+    ], aggregate_moments
 
 
 def _select_device(buckets: Sequence[NamedTensorBucket]) -> torch.device:
@@ -164,24 +160,30 @@ def _normalize_model_chunks(
     return [model_chunks]
 
 
-def _local_l2_norm_squared(tensors: Sequence[torch.Tensor], device: torch.device) -> torch.Tensor:
+def _local_raw_moments(tensors: Sequence[torch.Tensor], device: torch.device) -> torch.Tensor:
     if not tensors:
-        return torch.zeros(0, dtype=torch.float32, device=device)
+        return torch.zeros((0, len(RAW_MOMENT_FIELDS)), dtype=_RAW_MOMENTS_DTYPE, device=device)
 
-    if device.type == "cuda":
-        dummy_overflow_buf = torch.zeros((1,), dtype=torch.int, device=device)
-        _, per_tensor_norm = multi_tensor_applier(
-            multi_tensor_l2norm,
-            dummy_overflow_buf,
-            [list(tensors)],
-            True,  # per-parameter norm.
+    rows = []
+    for tensor in tensors:
+        values = tensor.detach().to(device=device, dtype=_RAW_MOMENTS_DTYPE)
+        values_2 = values * values
+        rows.append(
+            torch.stack(
+                [
+                    torch.tensor(float(values.numel()), dtype=_RAW_MOMENTS_DTYPE, device=device),
+                    values.sum(),
+                    values_2.sum(),
+                    (values_2 * values).sum(),
+                    (values_2 * values_2).sum(),
+                ]
+            )
         )
-        if per_tensor_norm is not None and per_tensor_norm.numel() == len(tensors):
-            return per_tensor_norm.to(dtype=torch.float32, device=device) ** 2
+    return torch.stack(rows)
 
-    return torch.stack(
-        [tensor.detach().to(dtype=torch.float32, device=device).pow(2).sum() for tensor in tensors]
-    )
+
+def _raw_moment_row_to_dict(row: Sequence[float]) -> dict[str, float]:
+    return {field: float(row[idx]) for idx, field in enumerate(RAW_MOMENT_FIELDS)}
 
 
 def _canonical_param_name(

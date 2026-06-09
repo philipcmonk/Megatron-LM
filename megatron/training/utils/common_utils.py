@@ -18,7 +18,7 @@ from megatron.core.msc_utils import open_file
 from megatron.core.per_parameter_stats import (
     NamedTensorBucket,
     get_or_create_per_parameter_stat_registry,
-    reduce_l2_norm_by_param,
+    reduce_raw_moments_by_param,
 )
 
 try:
@@ -52,46 +52,57 @@ from megatron.core.utils import (
 from megatron.core.transformer.module import param_is_not_shared
 
 
-# Relative tolerance for the by_param self-check: the per-parameter norms, recombined into an
-# aggregate, must match the independently-computed scalar norm to within this much. Float-noise
-# differences between the two paths are ~1e-7.
-_BY_PARAM_NORM_RTOL = 1e-2
+# Relative tolerance for the raw-moments self-check: sqrt(sum_2), recombined into an aggregate,
+# must match the independently-computed scalar norm to within this much.
+_RAW_MOMENTS_BY_PARAM_NORM_RTOL = 1e-2
 
 
-def calc_params_l2_norm(model, force_create_fp32_copy=False, by_param=False):
-    """Calculate l2 norm of parameters.
+def calc_params_l2_norm(model, force_create_fp32_copy=False):
+    """Calculate l2 norm of parameters."""
+    return _calc_params_l2_norm_or_raw_moments(
+        model, force_create_fp32_copy=force_create_fp32_copy, raw_moments_by_param=False
+    )
 
-    If ``by_param`` is False (default), returns the aggregate l2 norm as a scalar float.
 
-    If ``by_param`` is True, returns a list of ``(parameter_name, l2_norm)`` tuples. The
-    per-parameter norms are reduced across the same process groups as the aggregate norm,
-    so the result is correct for arbitrary tensor/pipeline/data parallelism (including the
-    distributed optimizer). Post-process the returned list to aggregate by layer, parameter
-    type, etc.
+def calc_params_raw_moments_by_param(model, force_create_fp32_copy=False):
+    """Calculate per-parameter raw moments of parameters."""
+    return _calc_params_l2_norm_or_raw_moments(
+        model, force_create_fp32_copy=force_create_fp32_copy, raw_moments_by_param=True
+    )
+
+
+def _calc_params_l2_norm_or_raw_moments(
+    model, force_create_fp32_copy=False, raw_moments_by_param=False
+):
+    """Calculate scalar parameter norm or per-parameter raw moments.
+
+    If ``raw_moments_by_param`` is False, returns the aggregate l2 norm as a scalar float.
+
+    If ``raw_moments_by_param`` is True, returns a list of ``(parameter_name, moments)`` tuples.
+    The raw moments are reduced across the same process groups as the aggregate norm.
 
     Expert parallelism: expert params are named by *local* expert index, which collides
-    across expert-parallel ranks. With ``--moe-grouped-gemm`` each rank's experts are stacked
-    into a single tensor, so the collision is benign -- disjoint experts summed over the
-    expert-parallel reduce group give a correct aggregate norm. Sequential experts collide on
-    distinct global experts and are not supported here (see the asserts below).
+    across expert-parallel ranks. With ``--moe-grouped-gemm`` each rank's experts are stacked into
+    a single tensor, so the collision is benign. Sequential experts collide on distinct global
+    experts and are not supported here (see the asserts below).
     """
     args = get_args()
     if not isinstance(model, list):
         model = [model]
 
-    if by_param and getattr(args, 'expert_model_parallel_size', 1) > 1:
+    if raw_moments_by_param and getattr(args, 'expert_model_parallel_size', 1) > 1:
         assert getattr(args, 'moe_grouped_gemm', False), (
-            "calc_params_l2_norm(by_param=True) with expert parallelism is only supported with "
-            "--moe-grouped-gemm; sequential experts collide on local expert names across "
-            "expert-parallel ranks."
+            "calc_params_raw_moments_by_param() with expert parallelism is only supported with "
+            "--moe-grouped-gemm; sequential experts collide on local expert names across expert-"
+            "parallel ranks."
         )
 
     if getattr(args, 'use_megatron_fsdp', False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
         # params_data is a dict of device_mesh -> list of local tensors.
-        if by_param:
+        if raw_moments_by_param:
             raise RuntimeError(
-                "calc_params_l2_norm(by_param=True) is not implemented for --use-megatron-fsdp"
+                "calc_params_raw_moments_by_param() is not implemented for --use-megatron-fsdp"
             )
         params = []
         for model_chunk in model:
@@ -106,16 +117,16 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False, by_param=False):
 
         return calc_dtensor_params_l2_norm(params)
 
-    per_param_registry = (
-        get_or_create_per_parameter_stat_registry(model) if by_param else None
+    raw_moments_registry = (
+        get_or_create_per_parameter_stat_registry(model) if raw_moments_by_param else None
     )
 
     # Seperate moe and dense params
     params_data = []
     moe_params_data = []
     sharded_params_data = []
-    # Parallel lists of parameter names, kept in lock-step with the *_params_data lists
-    # above. Only populated/used when by_param=True.
+    # Parallel lists of parameter names, kept in lock-step with the *_params_data lists above.
+    # Only populated/used when raw_moments_by_param=True.
     params_data_names = []
     moe_params_data_names = []
     sharded_params_data_names = []
@@ -128,7 +139,10 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False, by_param=False):
 
     for model_chunk in model:
         for name, param in unwrap_model(model_chunk).named_parameters():
-            param_name = per_param_registry.name_for_param(param) if by_param else name
+            if raw_moments_by_param:
+                param_name = raw_moments_registry.name_for_param(param)
+            else:
+                param_name = name
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
             is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
             if not is_not_tp_duplicate:
@@ -181,12 +195,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False, by_param=False):
     # Expert params should sum across all model-parallel GPUs (expert + tensor + pipeline).
     expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
 
-    if by_param:
+    if raw_moments_by_param:
         assert not (
             sharded_expert_params_present
             and getattr(args, 'expert_model_parallel_size', 1) > 1
         ), (
-            "calc_params_l2_norm(by_param=True) does not yet support distributed-optimizer-"
+            "calc_params_raw_moments_by_param() does not yet support distributed-optimizer-"
             "sharded expert main params under expert parallelism: they are reduced over the "
             "dense (non-expert-parallel) groups, which would drop other EP ranks' experts. "
             "Route them over the expert-DP / expert-model-parallel groups to support this."
@@ -203,7 +217,9 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False, by_param=False):
             ),
             NamedTensorBucket(moe_params_data_names, moe_params_data, (expert_reduce_group,)),
         ]
-        per_param_result, reconstructed_norm = reduce_l2_norm_by_param(per_param_registry, buckets)
+        raw_moments_by_param_result, aggregate_moments = reduce_raw_moments_by_param(
+            raw_moments_registry, buckets
+        )
 
     # Calculate norm.
     dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
@@ -281,19 +297,19 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False, by_param=False):
 
     scalar_norm = norm_2.item() ** 0.5
 
-    if by_param:
-        # Self-check: the per-parameter norms, recombined, should equal the scalar norm. A
-        # large discrepancy means the per-param reduction mishandled this parallelism config.
+    if raw_moments_by_param:
+        # Self-check: sqrt(sum_2) from the per-parameter raw moments should equal the scalar norm.
+        reconstructed_norm = aggregate_moments["sum_2"] ** 0.5
         rel_diff = abs(reconstructed_norm - scalar_norm) / scalar_norm if scalar_norm > 0 else 0.0
-        if rel_diff > _BY_PARAM_NORM_RTOL:
+        if rel_diff > _RAW_MOMENTS_BY_PARAM_NORM_RTOL:
             warn_rank_0(
-                "calc_params_l2_norm(by_param=True): per-parameter norms recombine to an "
+                "calc_params_raw_moments_by_param(): per-parameter sum_2 recombines to an "
                 f"aggregate of {reconstructed_norm:.6e}, but the directly-computed norm is "
                 f"{scalar_norm:.6e} (relative difference {rel_diff:.2e} > "
-                f"{_BY_PARAM_NORM_RTOL:.0e}). The per-parameter reduction is likely incorrect "
-                "for this parallelism configuration; treat the per-parameter norms with caution."
+                f"{_RAW_MOMENTS_BY_PARAM_NORM_RTOL:.0e}). The per-parameter reduction is likely "
+                "incorrect for this parallelism configuration; treat the raw moments with caution."
             )
-        return per_param_result
+        return raw_moments_by_param_result
 
     return scalar_norm
 

@@ -251,14 +251,13 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
-    log_params_norm_by_param: bool = False
-    """If set, calculate and log the l2 norm of each parameter separately (keyed by parameter
-    name) to JSONL statistics files. Uses the same parallelism support constraints as
-    calc_params_l2_norm(by_param=True)."""
+    log_param_raw_moments_by_param: bool = False
+    """If set, calculate and log count and raw sums of powers 1-4 for each parameter separately
+    (keyed by parameter name) to JSONL statistics files."""
 
-    log_grad_norm_by_param: bool = False
-    """If set, calculate and log the pre-clipping l2 norm of each parameter's gradient
-    separately (keyed by parameter name) to JSONL statistics files."""
+    log_grad_raw_moments_by_param: bool = False
+    """If set, calculate and log count and raw sums of powers 1-4 for each parameter's
+    pre-clipping gradient separately (keyed by parameter name) to JSONL statistics files."""
 
     statistics_log_dir: str | None = None
     """Directory for high-cardinality JSONL statistics. If unset, statistics use
