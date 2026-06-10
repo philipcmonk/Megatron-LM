@@ -165,6 +165,10 @@ def _local_raw_moments(tensors: Sequence[torch.Tensor], device: torch.device) ->
         return torch.zeros((0, len(RAW_MOMENT_FIELDS)), dtype=_RAW_MOMENTS_DTYPE, device=device)
 
     rows = []
+
+    # This is fairly slow, since it launches separate kernels for each tensor.
+    # If this becomes an issue, we should add a multi_tensor op to TE, similar
+    # to multi_tensor_l2norm.
     for tensor in tensors:
         values = tensor.detach().to(device=device, dtype=_RAW_MOMENTS_DTYPE)
         values_2 = values * values
