@@ -3,6 +3,8 @@
 import json
 
 from megatron.training.statistics_logging import (
+    save_activation_raw_moments_by_layer,
+    save_dgrad_raw_moments_by_layer,
     save_grad_raw_moments_by_param,
     save_param_raw_moments_by_param,
 )
@@ -150,6 +152,79 @@ class TestSaveGradRawMomentsByParam:
                         "sum_3": 12.25,
                         "sum_4": 16.25,
                     },
+                },
+            }
+        ]
+
+
+class TestSaveActivationRawMomentsByLayer:
+    def test_creates_jsonl(self, tmp_path):
+        save_activation_raw_moments_by_layer(
+            str(tmp_path),
+            iteration=100,
+            consumed_train_samples=8192,
+            activation_raw_moments_by_layer=[
+                (
+                    "decoder.layers.0.self_attention.linear_qkv/output0",
+                    {"count": 2, "sum_1": 1.5, "sum_2": 2.5, "sum_3": 3.5, "sum_4": 4.5},
+                )
+            ],
+            rank=2,
+        )
+
+        filepath = tmp_path / "training_stats" / "activation_raw_moments_by_layer" / "rank2.jsonl"
+        records = _read_records(filepath)
+        assert records == [
+            {
+                "iter": 100,
+                "consumed_train_samples": 8192,
+                "stat": "activation_raw_moments_by_layer",
+                "values": {
+                    "decoder.layers.0.self_attention.linear_qkv/output0": {
+                        "count": 2.0,
+                        "sum_1": 1.5,
+                        "sum_2": 2.5,
+                        "sum_3": 3.5,
+                        "sum_4": 4.5,
+                    }
+                },
+            }
+        ]
+
+
+class TestSaveDgradRawMomentsByLayer:
+    def test_creates_jsonl_with_loss_scale(self, tmp_path):
+        save_dgrad_raw_moments_by_layer(
+            str(tmp_path),
+            iteration=100,
+            consumed_train_samples=8192,
+            dgrad_raw_moments_by_layer=[
+                (
+                    "decoder.layers.0.self_attention.linear_qkv/input0",
+                    {"count": 3, "sum_1": 2.5, "sum_2": 4.5, "sum_3": 6.5, "sum_4": 8.5},
+                )
+            ],
+            rank=5,
+            loss_scale=128.0,
+        )
+
+        filepath = tmp_path / "training_stats" / "dgrad_raw_moments_by_layer" / "rank5.jsonl"
+        records = _read_records(filepath)
+        assert records == [
+            {
+                "iter": 100,
+                "consumed_train_samples": 8192,
+                "stat": "dgrad_raw_moments_by_layer",
+                "gradient_stage": "backward_scaled",
+                "loss_scale": 128.0,
+                "values": {
+                    "decoder.layers.0.self_attention.linear_qkv/input0": {
+                        "count": 3.0,
+                        "sum_1": 2.5,
+                        "sum_2": 4.5,
+                        "sum_3": 6.5,
+                        "sum_4": 8.5,
+                    }
                 },
             }
         ]

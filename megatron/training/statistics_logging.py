@@ -39,9 +39,30 @@ def save_raw_moments_by_param(
     extra_record_fields: dict | None = None,
 ) -> None:
     """Append one per-parameter raw moments record."""
+    save_raw_moments_by_name(
+        log_dir,
+        stat_name,
+        iteration,
+        consumed_train_samples,
+        raw_moments_by_param,
+        rank=rank,
+        extra_record_fields=extra_record_fields,
+    )
+
+
+def save_raw_moments_by_name(
+    log_dir: str,
+    stat_name: str,
+    iteration: int,
+    consumed_train_samples: int,
+    raw_moments_by_name: Iterable[tuple[str, dict[str, float]]],
+    rank: int | None = None,
+    extra_record_fields: dict | None = None,
+) -> None:
+    """Append one named raw moments record."""
     values = {
         name: {field: float(value) for field, value in raw_moments.items()}
-        for name, raw_moments in raw_moments_by_param
+        for name, raw_moments in raw_moments_by_name
     }
     if not values:
         return
@@ -97,4 +118,45 @@ def save_grad_raw_moments_by_param(
         grad_raw_moments_by_param,
         rank=rank,
         extra_record_fields={"gradient_stage": "pre_clip"},
+    )
+
+
+def save_activation_raw_moments_by_layer(
+    log_dir: str,
+    iteration: int,
+    consumed_train_samples: int,
+    activation_raw_moments_by_layer: Iterable[tuple[str, dict[str, float]]],
+    rank: int | None = None,
+) -> None:
+    """Append one activation raw moments record keyed by module site."""
+    save_raw_moments_by_name(
+        log_dir,
+        "activation_raw_moments_by_layer",
+        iteration,
+        consumed_train_samples,
+        activation_raw_moments_by_layer,
+        rank=rank,
+    )
+
+
+def save_dgrad_raw_moments_by_layer(
+    log_dir: str,
+    iteration: int,
+    consumed_train_samples: int,
+    dgrad_raw_moments_by_layer: Iterable[tuple[str, dict[str, float]]],
+    rank: int | None = None,
+    loss_scale: float | None = None,
+) -> None:
+    """Append one backward dgrad raw moments record keyed by module site."""
+    extra_record_fields = {"gradient_stage": "backward_scaled"}
+    if loss_scale is not None:
+        extra_record_fields["loss_scale"] = float(loss_scale)
+    save_raw_moments_by_name(
+        log_dir,
+        "dgrad_raw_moments_by_layer",
+        iteration,
+        consumed_train_samples,
+        dgrad_raw_moments_by_layer,
+        rank=rank,
+        extra_record_fields=extra_record_fields,
     )

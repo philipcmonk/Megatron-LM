@@ -136,9 +136,9 @@ def reduce_raw_moments_by_param(
         moments += bucket_moments
 
     rows = moments.tolist()
-    aggregate_moments = _raw_moment_row_to_dict(moments.sum(dim=0).tolist())
+    aggregate_moments = raw_moment_row_to_dict(moments.sum(dim=0).tolist())
     return [
-        (name, _raw_moment_row_to_dict(rows[idx]))
+        (name, raw_moment_row_to_dict(rows[idx]))
         for idx, name in enumerate(registry.index_to_name)
     ], aggregate_moments
 
@@ -164,29 +164,31 @@ def _local_raw_moments(tensors: Sequence[torch.Tensor], device: torch.device) ->
     if not tensors:
         return torch.zeros((0, len(RAW_MOMENT_FIELDS)), dtype=_RAW_MOMENTS_DTYPE, device=device)
 
-    rows = []
-
     # This is fairly slow, since it launches separate kernels for each tensor.
     # If this becomes an issue, we should add a multi_tensor op to TE, similar
     # to multi_tensor_l2norm.
-    for tensor in tensors:
-        values = tensor.detach().to(device=device, dtype=_RAW_MOMENTS_DTYPE)
-        values_2 = values * values
-        rows.append(
-            torch.stack(
-                [
-                    torch.tensor(float(values.numel()), dtype=_RAW_MOMENTS_DTYPE, device=device),
-                    values.sum(),
-                    values_2.sum(),
-                    (values_2 * values).sum(),
-                    (values_2 * values_2).sum(),
-                ]
-            )
-        )
+    rows = [raw_moment_row(tensor, device=device) for tensor in tensors]
     return torch.stack(rows)
 
 
-def _raw_moment_row_to_dict(row: Sequence[float]) -> dict[str, float]:
+def raw_moment_row(tensor: torch.Tensor, device: torch.device | None = None) -> torch.Tensor:
+    """Return count and raw sums of powers 1-4 for ``tensor`` as an fp32 row."""
+    device = tensor.device if device is None else device
+    values = tensor.detach().to(device=device, dtype=_RAW_MOMENTS_DTYPE)
+    values_2 = values * values
+    return torch.stack(
+        [
+            torch.tensor(float(values.numel()), dtype=_RAW_MOMENTS_DTYPE, device=device),
+            values.sum(),
+            values_2.sum(),
+            (values_2 * values).sum(),
+            (values_2 * values_2).sum(),
+        ]
+    )
+
+
+def raw_moment_row_to_dict(row: Sequence[float]) -> dict[str, float]:
+    """Convert a raw-moment row to a JSON-serializable mapping."""
     return {field: float(row[idx]) for idx, field in enumerate(RAW_MOMENT_FIELDS)}
 
 
