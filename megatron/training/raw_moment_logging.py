@@ -190,12 +190,16 @@ class RawMomentLogger:
             for index, site in enumerate(group_sites):
                 reduced_rows[site.name] = moments[index]
 
+        writer_sites = [site for site in sites if _is_writer(site.policy)]
+        if not writer_sites:
+            return []
+
+        rows = torch.stack([reduced_rows[site.name] for site in writer_sites]).detach().cpu().tolist()
         values = []
-        for site in sites:
-            row = reduced_rows[site.name]
-            if row[0].item() == 0 or not _is_writer(site.policy):
+        for site, row in zip(writer_sites, rows):
+            if row[0] == 0:
                 continue
-            values.append((site.name, raw_moment_row_to_dict(row.tolist())))
+            values.append((site.name, raw_moment_row_to_dict(row)))
         return values
 
 

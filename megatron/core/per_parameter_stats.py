@@ -10,6 +10,15 @@ from typing import Iterable, Sequence
 
 import torch
 
+try:
+    from transformer_engine.pytorch.optimizers import (
+        multi_tensor_applier,
+        multi_tensor_raw_moments,
+    )
+except ImportError:
+    multi_tensor_applier = None
+    multi_tensor_raw_moments = None
+
 from megatron.core import parallel_state
 from megatron.core.utils import unwrap_model
 
@@ -19,6 +28,7 @@ _GROUPED_EXPERT_PATTERN = re.compile(r"^(.*\.mlp\.experts\.linear_fc\d\.weight)(
 _SEQUENTIAL_EXPERT_PATTERN = re.compile(r"^(.*\.mlp\.experts\.local_experts\.)(\d+)(\..*)$")
 RAW_MOMENT_FIELDS = ("count", "sum_1", "sum_2", "sum_3", "sum_4")
 _RAW_MOMENTS_DTYPE = torch.float32
+_MULTI_TENSOR_RAW_MOMENTS_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 
 
 @dataclass(frozen=True)
@@ -164,15 +174,23 @@ def _local_raw_moments(tensors: Sequence[torch.Tensor], device: torch.device) ->
     if not tensors:
         return torch.zeros((0, len(RAW_MOMENT_FIELDS)), dtype=_RAW_MOMENTS_DTYPE, device=device)
 
-    # This is fairly slow, since it launches separate kernels for each tensor.
-    # If this becomes an issue, we should add a multi_tensor op to TE, similar
-    # to multi_tensor_l2norm.
-    rows = [raw_moment_row(tensor, device=device) for tensor in tensors]
+    if _can_use_multi_tensor_raw_moments(tensors, device):
+        return _multi_tensor_raw_moments(tensors, device)
+
+    rows = [_torch_raw_moment_row(tensor, device=device) for tensor in tensors]
     return torch.stack(rows)
 
 
 def raw_moment_row(tensor: torch.Tensor, device: torch.device | None = None) -> torch.Tensor:
     """Return count and raw sums of powers 1-4 for ``tensor`` as an fp32 row."""
+    device = tensor.device if device is None else device
+    if _can_use_multi_tensor_raw_moments([tensor], device):
+        return _multi_tensor_raw_moments([tensor], device)[0]
+    return _torch_raw_moment_row(tensor, device=device)
+
+
+def _torch_raw_moment_row(tensor: torch.Tensor, device: torch.device | None = None) -> torch.Tensor:
+    """Torch fallback for count and raw sums of powers 1-4."""
     device = tensor.device if device is None else device
     values = tensor.detach().to(device=device, dtype=_RAW_MOMENTS_DTYPE)
     values_2 = values * values
@@ -185,6 +203,56 @@ def raw_moment_row(tensor: torch.Tensor, device: torch.device | None = None) -> 
             (values_2 * values_2).sum(),
         ]
     )
+
+
+def _can_use_multi_tensor_raw_moments(
+    tensors: Sequence[torch.Tensor], device: torch.device
+) -> bool:
+    return (
+        multi_tensor_applier is not None
+        and multi_tensor_raw_moments is not None
+        and device.type == "cuda"
+        and all(
+            tensor.device == device
+            and tensor.dtype in _MULTI_TENSOR_RAW_MOMENTS_DTYPES
+            and tensor.is_contiguous()
+            for tensor in tensors
+        )
+    )
+
+
+def _multi_tensor_raw_moments(
+    tensors: Sequence[torch.Tensor], device: torch.device
+) -> torch.Tensor:
+    rows = torch.empty(
+        (len(tensors), len(RAW_MOMENT_FIELDS)),
+        dtype=_RAW_MOMENTS_DTYPE,
+        device=device,
+    )
+    grouped_indices = _group_tensor_indices_by_device_and_dtype(tensors)
+    if len(grouped_indices) == 1:
+        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device=device)
+        return multi_tensor_applier(
+            multi_tensor_raw_moments, dummy_overflow_buf, [[tensor.detach() for tensor in tensors]]
+        )
+
+    for indices in grouped_indices.values():
+        group_tensors = [tensors[index].detach() for index in indices]
+        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device=group_tensors[0].device)
+        group_rows = multi_tensor_applier(
+            multi_tensor_raw_moments, dummy_overflow_buf, [group_tensors]
+        )
+        rows[torch.tensor(indices, dtype=torch.long, device=device)] = group_rows
+    return rows
+
+
+def _group_tensor_indices_by_device_and_dtype(
+    tensors: Sequence[torch.Tensor],
+) -> dict[tuple[torch.device, torch.dtype], list[int]]:
+    groups = {}
+    for index, tensor in enumerate(tensors):
+        groups.setdefault((tensor.device, tensor.dtype), []).append(index)
+    return groups
 
 
 def raw_moment_row_to_dict(row: Sequence[float]) -> dict[str, float]:

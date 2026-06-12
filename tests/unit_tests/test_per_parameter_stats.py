@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core import per_parameter_stats as pps
 from megatron.core.per_parameter_stats import (
     NamedTensorBucket,
     PerParameterStatRegistry,
@@ -77,3 +78,29 @@ def test_registry_cache_is_per_model_identity():
     first_registry = get_or_create_per_parameter_stat_registry(first_model)
     assert get_or_create_per_parameter_stat_registry(first_model) is first_registry
     assert get_or_create_per_parameter_stat_registry(second_model) is not first_registry
+
+
+def test_local_raw_moments_multi_tensor_path_preserves_order(monkeypatch):
+    calls = []
+
+    def fake_multi_tensor_applier(op, noop_flag_buffer, tensor_lists):
+        calls.append([tensor.dtype for tensor in tensor_lists[0]])
+        return op(0, noop_flag_buffer, tensor_lists)
+
+    def fake_multi_tensor_raw_moments(_, __, tensor_lists):
+        return torch.stack([pps._torch_raw_moment_row(tensor) for tensor in tensor_lists[0]])
+
+    monkeypatch.setattr(pps, "multi_tensor_applier", fake_multi_tensor_applier)
+    monkeypatch.setattr(pps, "multi_tensor_raw_moments", fake_multi_tensor_raw_moments)
+    monkeypatch.setattr(pps, "_can_use_multi_tensor_raw_moments", lambda tensors, device: True)
+
+    tensors = [
+        torch.tensor([1.0, 2.0], dtype=torch.float32),
+        torch.tensor([3.0], dtype=torch.bfloat16),
+        torch.tensor([4.0, 5.0], dtype=torch.float32),
+    ]
+    rows = pps._local_raw_moments(tensors, torch.device("cpu"))
+    expected = torch.stack([pps._torch_raw_moment_row(tensor) for tensor in tensors])
+
+    torch.testing.assert_close(rows, expected)
+    assert calls == [[torch.float32, torch.float32], [torch.bfloat16]]
