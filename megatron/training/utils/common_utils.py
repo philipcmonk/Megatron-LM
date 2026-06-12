@@ -137,58 +137,64 @@ def _calc_params_l2_norm_or_raw_moments(
     sharded_expert_params_present = False
     data_parallel_group = None
 
-    for model_chunk in model:
-        for name, param in unwrap_model(model_chunk).named_parameters():
-            if raw_moments_by_param:
-                param_name = raw_moments_registry.name_for_param(param)
+    if raw_moments_by_param:
+        named_params = (
+            (param_name, param) for param, param_name in raw_moments_registry.param_to_name.items()
+        )
+    else:
+        named_params = (
+            (name, param)
+            for model_chunk in model
+            for name, param in unwrap_model(model_chunk).named_parameters()
+        )
+
+    for param_name, param in named_params:
+        data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+        if not is_not_tp_duplicate:
+            continue
+        assert is_not_tp_duplicate
+        if not getattr(param, 'allreduce', True):
+            assert param_is_not_shared(param)
+            param = to_local_if_dtensor(param)
+            if args.bf16:
+                if not force_create_fp32_copy and hasattr(param, 'main_param'):
+                    if getattr(param, 'main_param_sharded', False):
+                        sharded_expert_params_present = True
+                        if param.main_param is not None:
+                            sharded_params_data.append(param.main_param)
+                            sharded_params_data_names.append(param_name)
+                    else:
+                        moe_params_data.append(param.main_param)
+                        moe_params_data_names.append(param_name)
+                else:
+                    # Fallback to original logic of making a fp32 copy of the
+                    # parameter if `.main_param` attribute is not available.
+                    moe_params_data.append(param.data.float())
+                    moe_params_data_names.append(param_name)
             else:
-                param_name = name
-            data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-            if not is_not_tp_duplicate:
-                continue
-            assert is_not_tp_duplicate
-            if not getattr(param, 'allreduce', True):
-                assert param_is_not_shared(param)
+                moe_params_data.append(param.data)
+                moe_params_data_names.append(param_name)
+        else:
+            if param_is_not_shared(param):
                 param = to_local_if_dtensor(param)
                 if args.bf16:
                     if not force_create_fp32_copy and hasattr(param, 'main_param'):
                         if getattr(param, 'main_param_sharded', False):
-                            sharded_expert_params_present = True
                             if param.main_param is not None:
                                 sharded_params_data.append(param.main_param)
                                 sharded_params_data_names.append(param_name)
                         else:
-                            moe_params_data.append(param.main_param)
-                            moe_params_data_names.append(param_name)
+                            params_data.append(param.main_param)
+                            params_data_names.append(param_name)
                     else:
                         # Fallback to original logic of making a fp32 copy of the
                         # parameter if `.main_param` attribute is not available.
-                        moe_params_data.append(param.data.float())
-                        moe_params_data_names.append(param_name)
-                else:
-                    moe_params_data.append(param.data)
-                    moe_params_data_names.append(param_name)
-            else:
-                if param_is_not_shared(param):
-                    param = to_local_if_dtensor(param)
-                    if args.bf16:
-                        if not force_create_fp32_copy and hasattr(param, 'main_param'):
-                            if getattr(param, 'main_param_sharded', False):
-                                if param.main_param is not None:
-                                    sharded_params_data.append(param.main_param)
-                                    sharded_params_data_names.append(param_name)
-                            else:
-                                params_data.append(param.main_param)
-                                params_data_names.append(param_name)
-                        else:
-                            # Fallback to original logic of making a fp32 copy of the
-                            # parameter if `.main_param` attribute is not available.
-                            params_data.append(param.data.float())
-                            params_data_names.append(param_name)
-                    else:
-                        params_data.append(param.data)
+                        params_data.append(param.data.float())
                         params_data_names.append(param_name)
+                else:
+                    params_data.append(param.data)
+                    params_data_names.append(param_name)
 
     # Dense params should sum across all model-parallel GPUs (tensor + pipeline).
     dense_reduce_group = mpu.get_model_parallel_group()
