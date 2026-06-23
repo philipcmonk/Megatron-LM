@@ -125,16 +125,13 @@ def _calc_params_l2_norm_or_raw_moments(
     params_data = []
     moe_params_data = []
     sharded_params_data = []
+    sharded_moe_params_data = []
     # Parallel lists of parameter names, kept in lock-step with the *_params_data lists above.
     # Only populated/used when raw_moments_by_param=True.
     params_data_names = []
     moe_params_data_names = []
     sharded_params_data_names = []
-    # Tracks whether any expert (allreduce=False) param has a distributed-optimizer-sharded
-    # main param. Such params are reduced over the dense DP/CP and model-parallel groups
-    # (mirroring the scalar path), neither of which spans the expert-parallel group -- so the
-    # per-param result would silently drop other EP ranks' experts. Guarded below.
-    sharded_expert_params_present = False
+    sharded_moe_params_data_names = []
     data_parallel_group = None
 
     if raw_moments_by_param:
@@ -160,10 +157,9 @@ def _calc_params_l2_norm_or_raw_moments(
             if args.bf16:
                 if not force_create_fp32_copy and hasattr(param, 'main_param'):
                     if getattr(param, 'main_param_sharded', False):
-                        sharded_expert_params_present = True
                         if param.main_param is not None:
-                            sharded_params_data.append(param.main_param)
-                            sharded_params_data_names.append(param_name)
+                            sharded_moe_params_data.append(param.main_param)
+                            sharded_moe_params_data_names.append(param_name)
                     else:
                         moe_params_data.append(param.main_param)
                         moe_params_data_names.append(param_name)
@@ -202,15 +198,6 @@ def _calc_params_l2_norm_or_raw_moments(
     expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
 
     if raw_moments_by_param:
-        assert not (
-            sharded_expert_params_present
-            and getattr(args, 'expert_model_parallel_size', 1) > 1
-        ), (
-            "calc_params_raw_moments_by_param() does not yet support distributed-optimizer-"
-            "sharded expert main params under expert parallelism: they are reduced over the "
-            "dense (non-expert-parallel) groups, which would drop other EP ranks' experts. "
-            "Route them over the expert-DP / expert-model-parallel groups to support this."
-        )
         dense_reduce_groups = (
             (data_parallel_group,) if data_parallel_group is not None else ()
         ) + (dense_reduce_group,)
@@ -222,6 +209,11 @@ def _calc_params_l2_norm_or_raw_moments(
                 (mpu.get_data_parallel_group(with_context_parallel=True), dense_reduce_group),
             ),
             NamedTensorBucket(moe_params_data_names, moe_params_data, (expert_reduce_group,)),
+            NamedTensorBucket(
+                sharded_moe_params_data_names,
+                sharded_moe_params_data,
+                (mpu.get_expert_data_parallel_group(), expert_reduce_group),
+            ),
         ]
         raw_moments_by_param_result, aggregate_moments = reduce_raw_moments_by_param(
             raw_moments_registry, buckets
@@ -280,6 +272,24 @@ def _calc_params_l2_norm_or_raw_moments(
     # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
     else:
         moe_norm_2 = torch.zeros_like(norm_2)
+
+    if len(sharded_moe_params_data) > 0:
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        sharded_moe_norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm,
+            dummy_overflow_buf,
+            [sharded_moe_params_data],
+            False,  # no per-parameter norm.
+        )
+        sharded_moe_norm_2 = sharded_moe_norm * sharded_moe_norm
+    else:
+        sharded_moe_norm_2 = torch.zeros_like(norm_2)
+    torch.distributed.all_reduce(
+        sharded_moe_norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_expert_data_parallel_group(),
+    )
+    moe_norm_2 += sharded_moe_norm_2
 
     # Reduce norm across model parallel groups (dense and expert).
     ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)

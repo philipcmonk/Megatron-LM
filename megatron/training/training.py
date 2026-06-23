@@ -353,6 +353,14 @@ def _warn_missing_statistics_log_dir():
         )
         _STATS_LOG_DIR_WARNING_SHOWN = True
 
+
+def _get_activation_log_interval(args):
+    activation_log_interval = getattr(args, 'activation_log_interval', None)
+    if activation_log_interval is not None:
+        return activation_log_interval
+    return getattr(args, 'tensorboard_log_interval', None)
+
+
 # Per-iteration packed-sequence (THD) accumulator. The tensor holds TWO stats,
 # both computed from the REAL ``cu_seqlens`` (i.e. unpadded sub-sequence lengths
 # -- ``cu_seqlens_padded`` is intentionally ignored so that neither the
@@ -2226,18 +2234,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    raw_moment_log_interval = getattr(args, 'tensorboard_log_interval', None)
+    activation_log_interval = _get_activation_log_interval(args)
     log_activation_raw_moments_in_this_iteration = (
         getattr(args, 'log_activation_raw_moments_by_layer', False)
         and iteration is not None
-        and raw_moment_log_interval is not None
-        and (iteration + 1) % raw_moment_log_interval == 0
+        and activation_log_interval is not None
+        and (iteration + 1) % activation_log_interval == 0
     )
     log_dgrad_raw_moments_in_this_iteration = (
         getattr(args, 'log_dgrad_raw_moments_by_layer', False)
         and iteration is not None
-        and raw_moment_log_interval is not None
-        and (iteration + 1) % raw_moment_log_interval == 0
+        and activation_log_interval is not None
+        and (iteration + 1) % activation_log_interval == 0
     )
     if (
         log_activation_raw_moments_in_this_iteration or log_dgrad_raw_moments_in_this_iteration
@@ -3776,9 +3784,11 @@ def train(
                     args.consumed_train_samples,
                     grad_raw_moments_by_param,
                 )
+        activation_log_interval = _get_activation_log_interval(args)
         if (
             getattr(args, 'log_activation_raw_moments_by_layer', False)
-            and iteration % args.tensorboard_log_interval == 0
+            and activation_log_interval is not None
+            and iteration % activation_log_interval == 0
         ):
             activation_raw_moments_by_layer = consume_activation_raw_moments_by_layer()
             statistics_log_dir = _get_statistics_log_dir(args)
@@ -3793,7 +3803,8 @@ def train(
                 )
         if (
             getattr(args, 'log_dgrad_raw_moments_by_layer', False)
-            and iteration % args.tensorboard_log_interval == 0
+            and activation_log_interval is not None
+            and iteration % activation_log_interval == 0
         ):
             dgrad_raw_moments_by_layer = consume_dgrad_raw_moments_by_layer()
             statistics_log_dir = _get_statistics_log_dir(args)

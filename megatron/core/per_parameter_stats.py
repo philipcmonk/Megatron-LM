@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -29,6 +30,12 @@ _SEQUENTIAL_EXPERT_PATTERN = re.compile(r"^(.*\.mlp\.experts\.local_experts\.)(\
 RAW_MOMENT_FIELDS = ("count", "sum_1", "sum_2", "sum_3", "sum_4")
 _RAW_MOMENTS_DTYPE = torch.float32
 _MULTI_TENSOR_RAW_MOMENTS_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+_MULTI_TENSOR_RAW_MOMENTS_SPLIT_ALIGNMENT = 4
+_MAX_MULTI_TENSOR_RAW_MOMENTS_NUMEL = torch.iinfo(torch.int32).max - (
+    torch.iinfo(torch.int32).max % _MULTI_TENSOR_RAW_MOMENTS_SPLIT_ALIGNMENT
+)
+_DISABLE_MULTI_TENSOR_RAW_MOMENTS_ENV = "MCORE_DISABLE_MULTI_TENSOR_RAW_MOMENTS"
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -208,8 +215,10 @@ def _torch_raw_moment_row(tensor: torch.Tensor, device: torch.device | None = No
 def _can_use_multi_tensor_raw_moments(
     tensors: Sequence[torch.Tensor], device: torch.device
 ) -> bool:
+    disabled = os.getenv(_DISABLE_MULTI_TENSOR_RAW_MOMENTS_ENV, "").lower() in _TRUTHY_ENV_VALUES
     return (
-        multi_tensor_applier is not None
+        not disabled
+        and multi_tensor_applier is not None
         and multi_tensor_raw_moments is not None
         and device.type == "cuda"
         and all(
@@ -224,26 +233,61 @@ def _can_use_multi_tensor_raw_moments(
 def _multi_tensor_raw_moments(
     tensors: Sequence[torch.Tensor], device: torch.device
 ) -> torch.Tensor:
+    grouped_indices = _group_tensor_indices_by_device_and_dtype(tensors)
+    if len(grouped_indices) == 1:
+        return _multi_tensor_raw_moments_for_group(tensors, device)
+
     rows = torch.empty(
         (len(tensors), len(RAW_MOMENT_FIELDS)),
         dtype=_RAW_MOMENTS_DTYPE,
         device=device,
     )
-    grouped_indices = _group_tensor_indices_by_device_and_dtype(tensors)
-    if len(grouped_indices) == 1:
-        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device=device)
-        return multi_tensor_applier(
-            multi_tensor_raw_moments, dummy_overflow_buf, [[tensor.detach() for tensor in tensors]]
-        )
-
     for indices in grouped_indices.values():
-        group_tensors = [tensors[index].detach() for index in indices]
-        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device=group_tensors[0].device)
-        group_rows = multi_tensor_applier(
-            multi_tensor_raw_moments, dummy_overflow_buf, [group_tensors]
-        )
-        rows[torch.tensor(indices, dtype=torch.long, device=device)] = group_rows
+        group_tensors = [tensors[index] for index in indices]
+        group_rows = _multi_tensor_raw_moments_for_group(group_tensors, group_tensors[0].device)
+        rows[torch.tensor(indices, dtype=torch.long, device=device)] = group_rows.to(device=device)
     return rows
+
+
+def _multi_tensor_raw_moments_for_group(
+    tensors: Sequence[torch.Tensor], device: torch.device
+) -> torch.Tensor:
+    split_tensors, source_indices = _split_tensors_for_multi_tensor_raw_moments(tensors)
+    device = split_tensors[0].device
+    dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device=device)
+    split_rows = multi_tensor_applier(multi_tensor_raw_moments, dummy_overflow_buf, [split_tensors])
+    if len(split_tensors) == len(tensors):
+        return split_rows
+
+    rows = torch.zeros(
+        (len(tensors), len(RAW_MOMENT_FIELDS)),
+        dtype=_RAW_MOMENTS_DTYPE,
+        device=device,
+    )
+    rows.index_add_(0, torch.tensor(source_indices, dtype=torch.long, device=device), split_rows)
+    return rows
+
+
+def _split_tensors_for_multi_tensor_raw_moments(
+    tensors: Sequence[torch.Tensor],
+) -> tuple[list[torch.Tensor], list[int]]:
+    split_tensors = []
+    source_indices = []
+    for index, tensor in enumerate(tensors):
+        local_tensor = getattr(tensor, "_local_tensor", None)
+        if local_tensor is None:
+            local_tensor = tensor
+        flat_tensor = local_tensor.detach().view(-1)
+        if flat_tensor.numel() == 0 or flat_tensor.numel() <= _MAX_MULTI_TENSOR_RAW_MOMENTS_NUMEL:
+            split_tensors.append(flat_tensor)
+            source_indices.append(index)
+            continue
+
+        for start in range(0, flat_tensor.numel(), _MAX_MULTI_TENSOR_RAW_MOMENTS_NUMEL):
+            length = min(_MAX_MULTI_TENSOR_RAW_MOMENTS_NUMEL, flat_tensor.numel() - start)
+            split_tensors.append(flat_tensor.narrow(0, start, length))
+            source_indices.append(index)
+    return split_tensors, source_indices
 
 
 def _group_tensor_indices_by_device_and_dtype(

@@ -267,6 +267,10 @@ class LoggerConfig:
     """If set, calculate and log count and raw sums of powers 1-4 for backward data gradients
     keyed by module site to JSONL statistics files."""
 
+    activation_log_interval: int | None = None
+    """Interval for activation and dgrad raw-moment statistics. If unset, uses
+    tensorboard_log_interval."""
+
     statistics_log_dir: str | None = None
     """Directory for high-cardinality JSONL statistics. If unset, statistics use
     tensorboard_dir when available, then save as a fallback."""

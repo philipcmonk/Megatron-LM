@@ -68,15 +68,18 @@ class RawMomentLogger:
         self._activation_sites.clear()
         for module, input_site, output_site in _iter_hook_modules(model):
             input_key = input_site.name
-            output_key = output_site.name
             self._activation_sites[input_key] = input_site
-            self._activation_sites[output_key] = output_site
+            output_key = None
+            if output_site is not None:
+                output_key = output_site.name
+                self._activation_sites[output_key] = output_site
 
             def hook(_, args, __kwargs, output, input_key=input_key, output_key=output_key):
                 if not torch.is_grad_enabled():
                     return
                 self._add_tensor(self._activation_sites[input_key], _first_item(args))
-                self._add_tensor(self._activation_sites[output_key], _first_item(output))
+                if output_key is not None:
+                    self._add_tensor(self._activation_sites[output_key], _first_item(output))
 
             self._activation_hooks.append(module.register_forward_hook(hook, with_kwargs=True))
 
@@ -89,12 +92,15 @@ class RawMomentLogger:
         self._pending_dgrad_loss_scale = loss_scale
         for module, input_site, output_site in _iter_hook_modules(model):
             input_key = input_site.name
-            output_key = output_site.name
             self._dgrad_sites[input_key] = input_site
-            self._dgrad_sites[output_key] = output_site
+            output_key = None
+            if output_site is not None:
+                output_key = output_site.name
+                self._dgrad_sites[output_key] = output_site
 
             def hook(_, grad_input, grad_output, input_key=input_key, output_key=output_key):
-                self._add_tensor(self._dgrad_sites[output_key], _first_item(grad_output))
+                if output_key is not None:
+                    self._add_tensor(self._dgrad_sites[output_key], _first_item(grad_output))
                 self._add_tensor(self._dgrad_sites[input_key], _first_item(grad_input))
 
             self._dgrad_hooks.append(module.register_full_backward_hook(hook))
@@ -205,7 +211,7 @@ class RawMomentLogger:
 
 def _iter_hook_modules(
     model: Iterable[nn.Module] | nn.Module,
-) -> Iterable[tuple[nn.Module, _RawMomentSite, _RawMomentSite]]:
+) -> Iterable[tuple[nn.Module, _RawMomentSite, _RawMomentSite | None]]:
     model_chunks = model if isinstance(model, (list, tuple)) else [model]
     for model_chunk in model_chunks:
         unwrapped = unwrap_model(model_chunk)
@@ -215,11 +221,20 @@ def _iter_hook_modules(
             canonical_module_name = _canonical_module_name(unwrapped, module_name, module)
             input_site_name = f"{canonical_module_name}/input0"
             output_site_name = f"{canonical_module_name}/output0"
+            output_site = None
+            if not _is_output_layer_logits_site(canonical_module_name):
+                output_site = _RawMomentSite(
+                    output_site_name, _site_policy(module_name, module, "output0")
+                )
             yield (
                 module,
                 _RawMomentSite(input_site_name, _site_policy(module_name, module, "input0")),
-                _RawMomentSite(output_site_name, _site_policy(module_name, module, "output0")),
+                output_site,
             )
+
+
+def _is_output_layer_logits_site(module_name: str) -> bool:
+    return module_name.rsplit(".", maxsplit=1)[-1] == "output_layer"
 
 
 def _canonical_module_name(model_chunk: nn.Module, module_name: str, module: nn.Module) -> str:
