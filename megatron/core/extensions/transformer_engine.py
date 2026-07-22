@@ -87,22 +87,73 @@ _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 
 
 def _set_expert_parameter_attributes(
-    module: torch.nn.Module, parallel_mode: Optional[str], use_expert_groups: bool
+    module: torch.nn.Module,
+    parallel_mode: Optional[str],
+    use_expert_groups: bool,
+    weight_params: List[Parameter],
+    bias_params: List[Parameter],
 ) -> None:
     """Set expert gradient-reduction and tensor-partition metadata."""
-    for name, param in module.named_parameters(recurse=False):
+    all_params = tuple(module.parameters(recurse=False))
+    all_param_ids = {id(param) for param in all_params}
+    weight_param_ids = {id(param) for param in weight_params}
+    bias_param_ids = {id(param) for param in bias_params}
+    role_param_ids = weight_param_ids | bias_param_ids
+
+    if not role_param_ids <= all_param_ids:
+        raise ValueError("Weight and bias parameters must be registered directly on the module")
+    if weight_param_ids & bias_param_ids:
+        raise ValueError("A parameter cannot be both a weight and a bias")
+    if role_param_ids != all_param_ids:
+        unclassified = [
+            name
+            for name, param in module.named_parameters(recurse=False)
+            if id(param) not in role_param_ids
+        ]
+        raise ValueError(
+            "Every directly registered parameter must be classified as a weight or bias; "
+            f"unclassified parameters: {unclassified}"
+        )
+
+    for param in all_params:
         param.allreduce = not use_expert_groups
 
-        is_weight = name == "weight" or (name.startswith("weight") and name[6:].isdigit())
-        is_bias = name == "bias" or (name.startswith("bias") and name[4:].isdigit())
+        param_id = id(param)
         is_partitioned = parallel_mode in ("column", "row") and (
-            is_weight or (parallel_mode == "column" and is_bias)
+            param_id in weight_param_ids
+            or (parallel_mode == "column" and param_id in bias_param_ids)
         )
-        if is_weight or is_bias:
-            param.tensor_model_parallel = is_partitioned
+        param.tensor_model_parallel = is_partitioned
         if is_partitioned:
             param.partition_dim = 1 if parallel_mode == "row" else 0
             param.partition_stride = 1
+
+
+def _get_te_linear_parameter_roles(
+    module: torch.nn.Module,
+) -> Tuple[List[Parameter], List[Parameter]]:
+    """Return weights and biases using Transformer Engine's parameter metadata."""
+    params = dict(module.named_parameters(recurse=False))
+    weights = [params[name] for name in module.weight_names]
+    biases = [params[name] for name in module.bias_names if name in params]
+    return weights, biases
+
+
+def _get_te_grouped_linear_parameter_roles(
+    module: torch.nn.Module,
+) -> Tuple[List[Parameter], List[Parameter]]:
+    """Return registered weights and biases for either TE grouped-parameter layout."""
+    params = dict(module.named_parameters(recurse=False))
+    if "weight" in params:
+        weights = [params["weight"]]
+    else:
+        weights = [params[f"weight{i}"] for i in range(module.num_gemms)]
+
+    if "bias" in params:
+        biases = [params["bias"]]
+    else:
+        biases = [params[f"bias{i}"] for i in range(module.num_gemms) if f"bias{i}" in params]
+    return weights, biases
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -938,7 +989,10 @@ class TELinear(te.pytorch.Linear):
             )
 
         if is_expert:
-            _set_expert_parameter_attributes(self, parallel_mode, use_expert_groups)
+            weight_params, bias_params = _get_te_linear_parameter_roles(self)
+            _set_expert_parameter_attributes(
+                self, parallel_mode, use_expert_groups, weight_params, bias_params
+            )
         else:
             for param in self.parameters():
                 # Reduce the gradient on DP group
@@ -1340,7 +1394,10 @@ class TEColumnParallelLinear(TELinear):
                 config.expert_model_parallel_size > 1
                 or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
             )
-            _set_expert_parameter_attributes(self, "column", use_expert_groups)
+            weight_params, bias_params = _get_te_linear_parameter_roles(self)
+            _set_expert_parameter_attributes(
+                self, "column", use_expert_groups, weight_params, bias_params
+            )
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
@@ -1586,7 +1643,10 @@ class TERowParallelLinear(TELinear):
                 config.expert_model_parallel_size > 1
                 or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
             )
-            _set_expert_parameter_attributes(self, "row", use_expert_groups)
+            weight_params, bias_params = _get_te_linear_parameter_roles(self)
+            _set_expert_parameter_attributes(
+                self, "row", use_expert_groups, weight_params, bias_params
+            )
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
@@ -2076,7 +2136,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     **extra_kwargs,
                 )
 
-            _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_groups)
+            weight_params, bias_params = _get_te_grouped_linear_parameter_roles(self)
+            _set_expert_parameter_attributes(
+                self, original_parallel_mode, use_expert_groups, weight_params, bias_params
+            )
 
             self._register_load_state_dict_pre_hook(
                 type(self)._normalize_grouped_parameter_keys, with_module=True

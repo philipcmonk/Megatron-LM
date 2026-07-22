@@ -39,18 +39,37 @@ def _empty_load_args():
 @pytest.mark.parametrize(("parallel_mode", "partition_dim"), (("column", 0), ("row", 1)))
 def test_expert_parameter_attributes_use_expert_topology(parallel_mode, partition_dim):
     module = torch.nn.Module()
-    module.register_parameter("weight0", torch.nn.Parameter(torch.empty(4, 4)))
-    module.register_parameter("bias0", torch.nn.Parameter(torch.empty(4)))
+    module.register_parameter("matrix", torch.nn.Parameter(torch.empty(4, 4)))
+    module.register_parameter("offset", torch.nn.Parameter(torch.empty(4)))
 
     te_ext._set_expert_parameter_attributes(
-        module, parallel_mode=parallel_mode, use_expert_groups=True
+        module,
+        parallel_mode=parallel_mode,
+        use_expert_groups=True,
+        weight_params=[module.matrix],
+        bias_params=[module.offset],
     )
 
-    assert module.weight0.allreduce is False
-    assert module.weight0.tensor_model_parallel is True
-    assert module.weight0.partition_dim == partition_dim
-    assert module.bias0.allreduce is False
-    assert module.bias0.tensor_model_parallel is (parallel_mode == "column")
+    assert module.matrix.allreduce is False
+    assert module.matrix.tensor_model_parallel is True
+    assert module.matrix.partition_dim == partition_dim
+    assert module.offset.allreduce is False
+    assert module.offset.tensor_model_parallel is (parallel_mode == "column")
+
+
+def test_expert_parameter_attributes_reject_unclassified_parameter():
+    module = torch.nn.Module()
+    module.register_parameter("matrix", torch.nn.Parameter(torch.empty(4, 4)))
+    module.register_parameter("scale", torch.nn.Parameter(torch.empty(4)))
+
+    with pytest.raises(ValueError, match=r"unclassified parameters: \['scale'\]"):
+        te_ext._set_expert_parameter_attributes(
+            module,
+            parallel_mode="column",
+            use_expert_groups=True,
+            weight_params=[module.matrix],
+            bias_params=[],
+        )
 
 
 def test_split_grouped_checkpoint_tensor_uses_quantized_members():
