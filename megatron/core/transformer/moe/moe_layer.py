@@ -12,6 +12,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -567,6 +568,15 @@ class MoELayer(BaseMoELayer):
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
+        if is_observing_tensor("expert_output_squares"):
+            with torch.no_grad():
+                expert_output_squares = self.token_dispatcher.get_expert_output_squares(output)
+            observe_tensor(
+                self,
+                "expert_output_squares",
+                "expert_output_squares",
+                expert_output_squares,
+            )
 
         return output, mlp_bias
 

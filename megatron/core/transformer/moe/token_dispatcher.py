@@ -60,6 +60,34 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 logger = logging.getLogger(__name__)
 
 
+def expert_output_squares_by_local_expert(
+    hidden_states: torch.Tensor,
+    token_counts: torch.Tensor,
+    num_local_experts: int,
+) -> torch.Tensor:
+    """Reduce TP-complete routed-expert outputs to one sum of squares per local expert.
+
+    ``hidden_states`` is laid out in source-rank-major, local-expert-minor chunks, and
+    ``token_counts`` gives the length of each chunk with shape ``[sources, local_experts]``.
+    """
+    if hidden_states.ndim != 2:
+        raise ValueError("Expert outputs must have shape [tokens, hidden_size].")
+    if token_counts.ndim != 2 or token_counts.shape[1] != num_local_experts:
+        raise ValueError("Expert token counts must have shape [sources, local_experts].")
+    counts = token_counts.to(device=hidden_states.device, dtype=torch.long, non_blocking=True)
+    chunk_experts = torch.arange(num_local_experts, device=hidden_states.device).repeat(
+        counts.shape[0]
+    )
+    row_experts = torch.repeat_interleave(
+        chunk_experts, counts.reshape(-1), output_size=hidden_states.shape[0]
+    )
+    row_squares = hidden_states.float().square().sum(dim=-1)
+    expert_squares = torch.zeros(
+        num_local_experts, dtype=row_squares.dtype, device=hidden_states.device
+    )
+    return expert_squares.scatter_add_(0, row_experts, row_squares)
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -227,6 +255,12 @@ class MoETokenDispatcher:
             the communication buffers instead of into fresh allocations.
         """
         return None, None
+
+    def get_expert_output_squares(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return compact TP-complete expert-output contributions when supported."""
+        raise NotImplementedError(
+            f"Expert-output tensor metrics do not support {type(self).__name__}."
+        )
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -832,6 +866,24 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             ).to(hidden_states.dtype)
 
         return hidden_states
+
+    def get_expert_output_squares(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return one sum of squared output elements per local expert.
+
+        This runs after ``combine_preprocess`` has completed its expert-TP reduce-scatter and
+        before expert-parallel communication and final top-k contribution summation.
+        """
+        if self.num_local_experts == 1:
+            token_counts = torch.tensor(
+                [[hidden_states.shape[0]]], dtype=torch.long, device=hidden_states.device
+            )
+        else:
+            token_counts = self.num_global_tokens_per_local_expert.reshape(
+                self.tp_size, self.ep_size, self.num_local_experts
+            )[self.tp_rank]
+        return expert_output_squares_by_local_expert(
+            hidden_states, token_counts, self.num_local_experts
+        )
 
     def token_combine(
         self,

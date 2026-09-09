@@ -134,14 +134,15 @@ def test_tensor_metric_specs_include_forward_sources():
             "layer-residual-contribution-l2:2",
             "global-output-logits-l2:3",
             "global-mtp-logits-l2:4",
-            "layer-router-logits-l2:5",
-            "layer-router-logits-max:6",
-            "layer-router-logits-sampled-median:7",
-            "layer-router-decision-entropy:8",
-            "layer-router-seq-aux-decomposition:9",
-            "layer-router-routing-balance:10",
-            "layer-router-expert-bias:11",
-            "layer-router-health:12",
+            "layer-expert-output-l2-stats:5",
+            "layer-router-logits-l2:6",
+            "layer-router-logits-max:7",
+            "layer-router-logits-sampled-median:8",
+            "layer-router-decision-entropy:9",
+            "layer-router-seq-aux-decomposition:10",
+            "layer-router-routing-balance:11",
+            "layer-router-expert-bias:12",
+            "layer-router-health:13",
         ]
     )
 
@@ -150,6 +151,7 @@ def test_tensor_metric_specs_include_forward_sources():
         frozenset({"residual_contribution"}),
         frozenset({"output_logits"}),
         frozenset({"mtp_logits"}),
+        frozenset({"expert_output_squares"}),
         frozenset({"router_logits"}),
         frozenset({"router_logits"}),
         frozenset({"router_logits"}),
@@ -395,6 +397,62 @@ def test_forward_metrics_record_source_specific_shard_dimensions(sizes, axis, ex
         relation.placement == (expected_placement if relation.axis == axis else Replica())
         for relation in prepared_value.rank_relations
     )
+
+
+def test_expert_output_metrics_use_expert_parallel_rank_relations():
+    observer = build_tensor_metric_observer(
+        ["layer-expert-output-l2-stats:1"], result_sink=lambda *args: None
+    )
+    assert observer is not None
+    model = _forward_model()
+
+    with observer.observe_forward_backward(
+        model=[model],
+        iteration=0,
+        pg_collection=_pg_collection(
+            expert_tp=2, ep=4, expt_gtp_remat=2, expert_dp=3
+        ),
+    ):
+        observe_tensor(
+            model.decoder.layers[0],
+            "expert_output_squares",
+            "expert_output_squares",
+            torch.tensor([9.0, 16.0]),
+        )
+
+    assert observer._prepared_forward_values is not None
+    (prepared_value,) = next(iter(observer._prepared_forward_values.values()))
+    assert prepared_value.relation("expert_tp").placement == Shard(None)
+    assert prepared_value.relation("ep").placement == Shard(0)
+    assert prepared_value.relation("expert_gtp").placement == Shard(None)
+    assert prepared_value.relation("expert_dp").placement == Shard(None)
+
+
+def test_observer_reports_expert_output_l2_max_and_mean_by_layer():
+    captured = []
+    observer = build_tensor_metric_observer(
+        ["layer-expert-output-l2-stats:1"],
+        result_sink=lambda metric, results, iteration: captured.extend(results),
+    )
+    assert observer is not None
+    model = _forward_model()
+    pg_collection = _pg_collection()
+
+    with observer.observe_forward_backward(model=[model], iteration=0, pg_collection=pg_collection):
+        for squares in (torch.tensor([9.0, 16.0, 0.0]), torch.tensor([7.0, 9.0, 0.0])):
+            observe_tensor(
+                model.decoder.layers[0],
+                "expert_output_squares",
+                "expert_output_squares",
+                squares,
+            )
+    observer(
+        model=[model], optimizer=_fp32_optimizer(model), iteration=0, pg_collection=pg_collection
+    )
+
+    results_by_label = {result.label: result.tensor for result in captured}
+    torch.testing.assert_close(results_by_label["decoder.layers.0/max"], torch.tensor(5.0))
+    torch.testing.assert_close(results_by_label["decoder.layers.0/mean"], torch.tensor(3.0))
 
 
 def test_forward_metrics_reduce_gtp_and_dp_activation_populations_end_to_end():
@@ -812,6 +870,20 @@ def test_router_metrics_reject_cuda_graphs_that_capture_router(specification):
     )
 
     with pytest.raises(NotImplementedError, match="eager MoE router"):
+        with observer.observe_forward_backward(
+            model=[model], iteration=0, pg_collection=_pg_collection()
+        ):
+            pass
+
+
+def test_expert_output_metrics_reject_cuda_graphs_that_capture_moe():
+    observer = build_tensor_metric_observer(
+        ["layer-expert-output-l2-stats:1"], result_sink=lambda *args: None
+    )
+    assert observer is not None
+    model = _forward_model(cuda_graph_impl="local", cuda_graph_modules=(CudaGraphModule.moe,))
+
+    with pytest.raises(NotImplementedError, match="eager MoE expert"):
         with observer.observe_forward_backward(
             model=[model], iteration=0, pg_collection=_pg_collection()
         ):

@@ -34,6 +34,7 @@ from .definitions import (
     MeanColumnL2NormMetric,
     MeanRowL2NormMetric,
 )
+from .expert_output_metrics import LayerExpertOutputL2StatsMetric
 from .optimizer_sources import (
     _build_optimizer_parameter_manifest,
     _optimizer_metric_tensors,
@@ -152,6 +153,7 @@ _TENSOR_METRIC_FACTORIES: dict[str, Callable[[], TensorMetric]] = {
     "layer-residual-contribution-l2": _LayerResidualContributionL2NormMetric,
     "global-output-logits-l2": _GlobalOutputLogitsL2NormMetric,
     "global-mtp-logits-l2": _GlobalMTPLogitsL2NormMetric,
+    "layer-expert-output-l2-stats": LayerExpertOutputL2StatsMetric,
     "layer-router-logits-l2": LayerRouterLogitsL2NormMetric,
     "layer-router-logits-max": LayerRouterLogitsMaxMetric,
     "layer-router-logits-sampled-median": LayerRouterLogitsSampledMedianMetric,
@@ -172,6 +174,7 @@ _FORWARD_SOURCE_KINDS = frozenset(
         "router_logits",
         "router_scores",
         "router_diagnostics",
+        "expert_output_squares",
     }
 )
 _SUPPORTED_SOURCE_KINDS = _OPTIMIZER_SOURCE_KINDS | _FORWARD_SOURCE_KINDS
@@ -342,7 +345,7 @@ class TrainingTensorMetricObserver:
                 tensor=tensor,
                 sites=(site,),
                 rank_relations=_forward_rank_relations(
-                    tp_shard_dim, sequence_dim, batch_dim, pg_collection
+                    source_kind, tp_shard_dim, sequence_dim, batch_dim, pg_collection
                 ),
             )
             # Deliberately untimed: Megatron timers synchronize the device when they start and
@@ -516,12 +519,33 @@ class TrainingTensorMetricObserver:
 
 
 def _forward_rank_relations(
+    source_kind: str,
     tp_shard_dim: int | None,
     sequence_dim: int | None,
     batch_dim: int | None,
     pg_collection: ProcessGroupCollection,
 ) -> tuple[RankRelation, ...]:
-    """Describe a forward tensor over tensor, context, GTP, and data parallel ranks."""
+    """Describe a forward tensor over its model and activation-population rank axes."""
+    if source_kind == "expert_output_squares":
+        groups = {
+            "expert_tp": getattr(pg_collection, "expt_tp", None),
+            "ep": getattr(pg_collection, "ep", None),
+            "expert_gtp": getattr(pg_collection, "expt_gtp_remat", None),
+            "expert_dp": getattr(pg_collection, "expt_dp", None),
+        }
+        missing = [axis for axis, group in groups.items() if group is None]
+        if missing:
+            raise ValueError(
+                "Expert-output tensor metrics require expert TP, EP, GTP, and DP process groups; "
+                f"missing axes: {missing}."
+            )
+        return tuple(
+            RankRelation(
+                axis, Shard(0 if axis == "ep" else None) if group.size() > 1 else Replica()
+            )
+            for axis, group in groups.items()
+        )
+
     tp_group = getattr(pg_collection, "tp", None)
     cp_group = getattr(pg_collection, "cp", None)
     gtp_group = getattr(pg_collection, "gtp_remat", None)
@@ -555,19 +579,37 @@ def _validate_forward_observation_model(
             raise NotImplementedError(
                 "Forward tensor metrics do not yet support full-iteration CUDA graphs."
             )
-        if source_kinds.isdisjoint(
-            {"router_logits", "router_scores", "router_diagnostics"}
-        ) or cuda_graph_impl not in {"local", "transformer_engine"}:
-            continue
         graph_modules = tuple(getattr(config, "cuda_graph_modules", ()))
-        if not graph_modules or any(
-            graph_module
-            in {CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess}
-            for graph_module in graph_modules
+        observes_router = not source_kinds.isdisjoint(
+            {"router_logits", "router_scores", "router_diagnostics"}
+        )
+        if (
+            observes_router
+            and cuda_graph_impl in {"local", "transformer_engine"}
+            and (
+                not graph_modules
+                or any(
+                    graph_module
+                    in {
+                        CudaGraphModule.moe,
+                        CudaGraphModule.moe_router,
+                        CudaGraphModule.moe_preprocess,
+                    }
+                    for graph_module in graph_modules
+                )
+            )
         ):
             raise NotImplementedError(
                 "Router tensor metrics require an eager MoE router; disable moe, "
                 "moe_router, and moe_preprocess CUDA graph modules for now."
+            )
+        if "expert_output_squares" in source_kinds and cuda_graph_impl in {
+            "local",
+            "transformer_engine",
+        } and (not graph_modules or CudaGraphModule.moe in graph_modules):
+            raise NotImplementedError(
+                "Expert-output tensor metrics require eager MoE expert and combine execution; "
+                "disable the moe CUDA graph module for now."
             )
 
 

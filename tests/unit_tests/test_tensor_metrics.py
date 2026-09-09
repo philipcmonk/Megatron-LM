@@ -36,6 +36,7 @@ from megatron.training.tensor_metrics.definitions import (
     MeanRowL2NormMetric,
     _accumulation_dtype,
 )
+from megatron.training.tensor_metrics.expert_output_metrics import LayerExpertOutputL2StatsMetric
 from megatron.training.tensor_metrics.router_metrics import (
     LayerRouterExpertBiasMetric,
     LayerRouterHealthMetric,
@@ -292,6 +293,60 @@ def test_layer_l2_norm_metric_reduces_selected_parameters_by_layer():
     assert [result.label for result in results] == ["decoder.layers.0", "decoder.layers.1"]
     torch.testing.assert_close(results[0].tensor, torch.sqrt(torch.tensor(50.0)))
     torch.testing.assert_close(results[1].tensor, torch.tensor(10.0))
+
+
+def test_expert_output_metric_accumulates_microbatches_before_computing_expert_norms():
+    relations = (RankRelation("ep", Replica()),)
+    items = [
+        _item(
+            "decoder.layers.2.mlp.expert_output_squares",
+            torch.tensor([9.0, 16.0, 0.0]),
+            relations,
+            kind="expert_output_squares",
+        ),
+        _item(
+            "decoder.layers.2.mlp.expert_output_squares",
+            torch.tensor([7.0, 9.0, 0.0]),
+            relations,
+            kind="expert_output_squares",
+        ),
+    ]
+
+    results = TensorMetricExecutor({}).run(LayerExpertOutputL2StatsMetric(), items)
+    results_by_label = {result.label: result.tensor for result in results}
+
+    torch.testing.assert_close(results_by_label["decoder.layers.2/max"], torch.tensor(5.0))
+    torch.testing.assert_close(results_by_label["decoder.layers.2/mean"], torch.tensor(3.0))
+
+
+def test_expert_output_metric_reduces_populations_then_gathers_global_experts(monkeypatch):
+    _fake_distributed(
+        monkeypatch,
+        [torch.tensor([[8.0, 5.0], [8.0, 5.0]])],
+    )
+    _fake_all_gather(
+        monkeypatch,
+        torch.tensor([[16.0, 25.0], [16.0, 25.0]]),
+    )
+    item = _item(
+        "decoder.layers.1.mlp.expert_output_squares",
+        torch.tensor([1.0, 4.0]),
+        (
+            RankRelation("expert_tp", Shard(None)),
+            RankRelation("ep", Shard(0)),
+            RankRelation("expert_gtp", Replica()),
+            RankRelation("expert_dp", Replica()),
+        ),
+        kind="expert_output_squares",
+    )
+
+    results = TensorMetricExecutor({"expert_tp": object(), "ep": object()}).run(
+        LayerExpertOutputL2StatsMetric(), [item]
+    )
+    results_by_label = {result.label: result.tensor for result in results}
+
+    torch.testing.assert_close(results_by_label["decoder.layers.1/max"], torch.tensor(5.0))
+    torch.testing.assert_close(results_by_label["decoder.layers.1/mean"], torch.tensor(3.75))
 
 
 def test_layer_l2_norm_metric_can_add_an_exact_global_result():

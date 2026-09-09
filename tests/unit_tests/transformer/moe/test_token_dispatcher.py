@@ -15,7 +15,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
+from megatron.core.transformer.moe.token_dispatcher import (
+    _HybridEPManager,
+    expert_output_squares_by_local_expert,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -38,6 +41,17 @@ def token_unpermutation(token_dispatcher, hidden_states):
     hidden_states = token_dispatcher.token_combine(hidden_states)
     hidden_states = token_dispatcher.combine_postprocess(hidden_states)
     return hidden_states, None
+
+
+def test_expert_output_squares_by_local_expert_handles_interleaved_source_chunks():
+    hidden_states = torch.tensor(
+        [[3.0, 4.0], [0.0, 1.0], [0.0, 2.0], [1.0, 2.0], [2.0, 2.0]]
+    )
+    token_counts = torch.tensor([[1, 2], [2, 0]])
+
+    result = expert_output_squares_by_local_expert(hidden_states, token_counts, 2)
+
+    torch.testing.assert_close(result, torch.tensor([38.0, 5.0]))
 
 
 class MoEModelTestContainer:
