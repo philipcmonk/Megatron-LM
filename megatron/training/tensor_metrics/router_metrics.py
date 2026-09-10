@@ -26,6 +26,7 @@ from .core import (
     CollectiveRequest,
     CollectiveStage,
     FlatShard,
+    LogicalReductionMetric,
     MetricResult,
     MetricSite,
     MetricStep,
@@ -48,6 +49,7 @@ __all__ = [
     "LayerRouterLogitsL2NormMetric",
     "LayerRouterLogitsMaxMetric",
     "LayerRouterLogitsSampledMedianMetric",
+    "LayerRouterTopKMaxStdMetric",
     "LayerRouterRoutingBalanceMetric",
     "LayerRouterSeqAuxDecompositionMetric",
 ]
@@ -83,6 +85,56 @@ class LayerRouterDecisionEntropyMetric(LayerNormalizedEntropyMetric):
     name = "layer-router-decision-entropy"
     source_kinds = frozenset({"router_scores"})
     include_global = True
+
+
+class LayerRouterTopKMaxStdMetric(LogicalReductionMetric):
+    """Report the population standard deviation of each token's largest routing probability.
+
+    The observed probabilities have already been restricted to the selected experts, normalized
+    within that top-k set, and multiplied by the configured router scaling factor. All-zero rows
+    represent padding and are excluded from the token population.
+    """
+
+    name = "layer-router-topk-max-std"
+    source_kinds = frozenset({"router_topk_probs"})
+
+    def accepts(self, site: MetricSite) -> bool:
+        """Select top-k router probability sites belonging to numbered layers."""
+        return super().accepts(site) and LayerL2NormMetric._site_layer_label(site) is not None
+
+    def prepare(self, values: Sequence[MetricTensor]) -> list[MetricTensor]:
+        """Compact each probability tensor to max-probability moments and a token count."""
+        return super().prepare(LayerL2NormMetric._selected_values(values))
+
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one population-moment reduction for each numbered layer."""
+        return self._start_logical_reductions(
+            LayerL2NormMetric._reductions_by_layer(values, include_global=False)
+        )
+
+    def contribution(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return sum, squared sum, and count of valid per-token maximum probabilities."""
+        if tensor.ndim < 2 or tensor.shape[-1] == 0:
+            raise ValueError(
+                "Router top-k probability metrics require shape [..., num_experts]."
+            )
+        scores = tensor.float()
+        valid = scores.abs().sum(dim=-1) > 0
+        token_max = scores.amax(dim=-1)[valid]
+        return torch.stack(
+            (
+                token_max.sum(),
+                token_max.square().sum(),
+                token_max.new_tensor(token_max.numel()),
+            )
+        )
+
+    def finalize(self, contribution: torch.Tensor) -> torch.Tensor:
+        """Convert globally reduced moments to a population standard deviation."""
+        count = contribution[2].clamp_min(1)
+        mean = contribution[0] / count
+        variance = (contribution[1] / count - mean.square()).clamp_min(0)
+        return variance.sqrt()
 
 
 @dataclass(frozen=True)

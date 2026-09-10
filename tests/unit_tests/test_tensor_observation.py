@@ -243,3 +243,56 @@ def test_router_observes_normalized_configured_decision_scores():
         assert observed[0][4] is None
         assert observed[0][5:] == (0, 1)
         assert not observed[0][3].requires_grad
+
+
+def test_router_observes_scaled_topk_probabilities_before_token_dropping(monkeypatch):
+    router = TopKRouter.__new__(TopKRouter)
+    torch.nn.Module.__init__(router)
+    router.config = SimpleNamespace(
+        num_moe_experts=3,
+        sequence_parallel=False,
+        moe_router_pre_softmax=False,
+        moe_router_num_groups=None,
+        moe_router_group_topk=None,
+        moe_router_topk_scaling_factor=2.5,
+        moe_router_fusion=False,
+        moe_expert_capacity_factor=None,
+    )
+    router.routing_type = "none"
+    router.topk = 2
+    router.score_function = "sigmoid"
+    router.expert_bias = None
+    router.router_replay = None
+    router.apply_z_loss = lambda logits, padding_mask=None: logits
+    router.is_aux_loss_enabled = lambda: False
+    router._apply_expert_bias = lambda routing_map, padding_mask=None: None
+    routed_probs = torch.tensor(
+        [[1.5, 1.0, 0.0], [2.0, 0.5, 0.0], [1.25, 1.25, 0.0], [2.5, 0.0, 0.0]]
+    )
+    routing_map = routed_probs > 0
+    monkeypatch.setattr(
+        router_mod,
+        "topk_routing_with_score_function",
+        lambda *args, **kwargs: (routed_probs, routing_map),
+    )
+    observed = []
+
+    with capture_tensor_observations(
+        lambda *args: observed.append(args), frozenset({"router_topk_probs"})
+    ):
+        result, _ = router.routing(
+            torch.zeros(2, 2, 3),
+            padding_mask=torch.tensor([[False, True], [False, False]]),
+        )
+
+    assert len(observed) == 1
+    assert observed[0][:3] == (router, "router_topk_probs", "router_topk_probs")
+    torch.testing.assert_close(
+        observed[0][3],
+        torch.tensor(
+            [[[1.5, 1.0, 0.0], [0.0, 0.0, 0.0]], [[1.25, 1.25, 0.0], [2.5, 0.0, 0.0]]]
+        ),
+    )
+    assert observed[0][4:] == (None, 0, 1)
+    assert not observed[0][3].requires_grad
+    torch.testing.assert_close(result, routed_probs)

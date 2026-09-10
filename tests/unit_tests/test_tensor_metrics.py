@@ -42,6 +42,7 @@ from megatron.training.tensor_metrics.router_metrics import (
     LayerRouterHealthMetric,
     LayerRouterRoutingBalanceMetric,
     LayerRouterSeqAuxDecompositionMetric,
+    LayerRouterTopKMaxStdMetric,
 )
 
 SITE = MetricSite("decoder.layers.0.linear.weight", "parameter")
@@ -618,6 +619,40 @@ def test_logical_reduction_metric_exposes_contribution_batch_hook():
     torch.testing.assert_close(_result_tensor(results), torch.tensor(3.0))
     assert results[0].label == "global"
     assert metric.batch_sizes == [2]
+
+
+def test_router_topk_max_std_accumulates_microbatches_and_ignores_padding():
+    items = [
+        _item(
+            "decoder.layers.2.router.router_topk_probs",
+            torch.tensor([[[0.5, 0.4, 0.0], [1.5, 0.5, 0.0]]]),
+            kind="router_topk_probs",
+        ),
+        _item(
+            "decoder.layers.2.router.router_topk_probs",
+            torch.tensor([[[2.5, 0.0, 0.0], [0.0, 0.0, 0.0]]]),
+            kind="router_topk_probs",
+        ),
+    ]
+
+    results = TensorMetricExecutor({}).run(LayerRouterTopKMaxStdMetric(), items)
+
+    assert results[0].label == "decoder.layers.2"
+    torch.testing.assert_close(results[0].tensor, torch.tensor(2.0 / 3.0).sqrt())
+
+
+def test_router_topk_max_std_reduces_distributed_token_populations(monkeypatch):
+    _fake_distributed(monkeypatch, [torch.tensor([2.5, 6.25, 1.0])])
+    item = _item(
+        "decoder.layers.1.router.router_topk_probs",
+        torch.tensor([[0.5, 0.4], [1.5, 0.5]]),
+        (RankRelation("dp", Shard(None)),),
+        kind="router_topk_probs",
+    )
+
+    results = TensorMetricExecutor({"dp": object()}).run(LayerRouterTopKMaxStdMetric(), [item])
+
+    torch.testing.assert_close(results[0].tensor, torch.tensor(2.0 / 3.0).sqrt())
 
 
 def test_executor_can_prepare_locally_and_complete_steps_later(monkeypatch):

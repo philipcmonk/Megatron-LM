@@ -49,6 +49,7 @@ from .router_metrics import (
     LayerRouterLogitsSampledMedianMetric,
     LayerRouterRoutingBalanceMetric,
     LayerRouterSeqAuxDecompositionMetric,
+    LayerRouterTopKMaxStdMetric,
 )
 
 __all__ = [
@@ -158,6 +159,7 @@ _TENSOR_METRIC_FACTORIES: dict[str, Callable[[], TensorMetric]] = {
     "layer-router-logits-max": LayerRouterLogitsMaxMetric,
     "layer-router-logits-sampled-median": LayerRouterLogitsSampledMedianMetric,
     "layer-router-decision-entropy": LayerRouterDecisionEntropyMetric,
+    "layer-router-topk-max-std": LayerRouterTopKMaxStdMetric,
     "layer-router-health": LayerRouterHealthMetric,
     "layer-router-seq-aux-decomposition": LayerRouterSeqAuxDecompositionMetric,
     "layer-router-routing-balance": LayerRouterRoutingBalanceMetric,
@@ -173,6 +175,7 @@ _FORWARD_SOURCE_KINDS = frozenset(
         "mtp_logits",
         "router_logits",
         "router_scores",
+        "router_topk_probs",
         "router_diagnostics",
         "expert_output_squares",
     }
@@ -581,7 +584,7 @@ def _validate_forward_observation_model(
             )
         graph_modules = tuple(getattr(config, "cuda_graph_modules", ()))
         observes_router = not source_kinds.isdisjoint(
-            {"router_logits", "router_scores", "router_diagnostics"}
+            {"router_logits", "router_scores", "router_topk_probs", "router_diagnostics"}
         )
         if (
             observes_router

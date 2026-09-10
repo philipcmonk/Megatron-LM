@@ -139,10 +139,11 @@ def test_tensor_metric_specs_include_forward_sources():
             "layer-router-logits-max:7",
             "layer-router-logits-sampled-median:8",
             "layer-router-decision-entropy:9",
-            "layer-router-seq-aux-decomposition:10",
-            "layer-router-routing-balance:11",
-            "layer-router-expert-bias:12",
-            "layer-router-health:13",
+            "layer-router-topk-max-std:10",
+            "layer-router-seq-aux-decomposition:11",
+            "layer-router-routing-balance:12",
+            "layer-router-expert-bias:13",
+            "layer-router-health:14",
         ]
     )
 
@@ -156,6 +157,7 @@ def test_tensor_metric_specs_include_forward_sources():
         frozenset({"router_logits"}),
         frozenset({"router_logits"}),
         frozenset({"router_scores"}),
+        frozenset({"router_topk_probs"}),
         frozenset({"router_diagnostics"}),
         frozenset({"router_diagnostics"}),
         frozenset({"router_diagnostics"}),
@@ -668,6 +670,32 @@ def test_observer_prepares_and_accumulates_forward_sources_until_commit():
     assert observer._prepared_forward_values is None
 
 
+def test_observer_reports_router_topk_max_population_std_by_layer():
+    captured = []
+    observer = build_tensor_metric_observer(
+        ["layer-router-topk-max-std:1"],
+        result_sink=lambda metric, results, iteration: captured.extend(results),
+    )
+    assert observer is not None
+    model = _forward_model()
+    pg_collection = _pg_collection()
+
+    with observer.observe_forward_backward(model=[model], iteration=0, pg_collection=pg_collection):
+        observe_tensor(
+            model.decoder.layers[0].router,
+            "router_topk_probs",
+            "router_topk_probs",
+            torch.tensor([[0.5, 0.4, 0.0], [1.5, 0.5, 0.0], [2.5, 0.0, 0.0]]),
+        )
+    observer(
+        model=[model], optimizer=_fp32_optimizer(model), iteration=0, pg_collection=pg_collection
+    )
+
+    assert len(captured) == 1
+    assert captured[0].label == "decoder.layers.0"
+    torch.testing.assert_close(captured[0].tensor, torch.tensor(2.0 / 3.0).sqrt())
+
+
 def test_forward_observer_delegates_site_filtering_to_executor():
     class ResidualMetric(LayerL2NormMetric):
         source_kinds = frozenset({"residual_accumulator"})
@@ -858,6 +886,7 @@ def test_forward_metrics_allow_partial_cuda_graphs_outside_observation_sites():
     (
         "layer-router-logits-l2:1",
         "layer-router-decision-entropy:1",
+        "layer-router-topk-max-std:1",
         "layer-router-seq-aux-decomposition:1",
         "layer-router-health:1",
     ),

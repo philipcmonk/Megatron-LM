@@ -807,6 +807,25 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
             )
 
+        if is_observing_tensor("router_topk_probs"):
+            with torch.no_grad():
+                observed_probs = probs.detach().view(
+                    seq_length, bsz, self.config.num_moe_experts
+                )
+                if padding_mask is not None:
+                    observed_probs = observed_probs.masked_fill(
+                        padding_mask.view(seq_length, bsz, 1), 0.0
+                    )
+                observe_tensor(
+                    self,
+                    "router_topk_probs",
+                    "router_topk_probs",
+                    observed_probs,
+                    tp_shard_dim=0 if self.config.sequence_parallel else None,
+                    sequence_dim=0,
+                    batch_dim=1,
+                )
+
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
