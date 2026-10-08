@@ -321,14 +321,8 @@ def test_expert_output_metric_accumulates_microbatches_before_computing_expert_n
 
 
 def test_expert_output_metric_reduces_populations_then_gathers_global_experts(monkeypatch):
-    _fake_distributed(
-        monkeypatch,
-        [torch.tensor([[8.0, 5.0], [8.0, 5.0]])],
-    )
-    _fake_all_gather(
-        monkeypatch,
-        torch.tensor([[16.0, 25.0], [16.0, 25.0]]),
-    )
+    _fake_distributed(monkeypatch, [torch.tensor([[8.0, 5.0], [8.0, 5.0]])])
+    _fake_all_gather(monkeypatch, torch.tensor([[16.0, 25.0], [16.0, 25.0]]))
     item = _item(
         "decoder.layers.1.mlp.expert_output_squares",
         torch.tensor([1.0, 4.0]),

@@ -281,17 +281,14 @@ def test_router_observes_scaled_topk_probabilities_before_token_dropping(monkeyp
         lambda *args: observed.append(args), frozenset({"router_topk_probs"})
     ):
         result, _ = router.routing(
-            torch.zeros(2, 2, 3),
-            padding_mask=torch.tensor([[False, True], [False, False]]),
+            torch.zeros(2, 2, 3), padding_mask=torch.tensor([[False, True], [False, False]])
         )
 
     assert len(observed) == 1
     assert observed[0][:3] == (router, "router_topk_probs", "router_topk_probs")
     torch.testing.assert_close(
         observed[0][3],
-        torch.tensor(
-            [[[1.5, 1.0, 0.0], [0.0, 0.0, 0.0]], [[1.25, 1.25, 0.0], [2.5, 0.0, 0.0]]]
-        ),
+        torch.tensor([[[1.5, 1.0, 0.0], [0.0, 0.0, 0.0]], [[1.25, 1.25, 0.0], [2.5, 0.0, 0.0]]]),
     )
     assert observed[0][4:] == (None, 0, 1)
     assert not observed[0][3].requires_grad

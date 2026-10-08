@@ -44,9 +44,7 @@ def token_unpermutation(token_dispatcher, hidden_states):
 
 
 def test_expert_output_squares_by_local_expert_handles_interleaved_source_chunks():
-    hidden_states = torch.tensor(
-        [[3.0, 4.0], [0.0, 1.0], [0.0, 2.0], [1.0, 2.0], [2.0, 2.0]]
-    )
+    hidden_states = torch.tensor([[3.0, 4.0], [0.0, 1.0], [0.0, 2.0], [1.0, 2.0], [2.0, 2.0]])
     token_counts = torch.tensor([[1, 2], [2, 0]])
 
     result = expert_output_squares_by_local_expert(hidden_states, token_counts, 2)

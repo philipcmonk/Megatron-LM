@@ -411,9 +411,7 @@ def test_expert_output_metrics_use_expert_parallel_rank_relations():
     with observer.observe_forward_backward(
         model=[model],
         iteration=0,
-        pg_collection=_pg_collection(
-            expert_tp=2, ep=4, expt_gtp_remat=2, expert_dp=3
-        ),
+        pg_collection=_pg_collection(expert_tp=2, ep=4, expt_gtp_remat=2, expert_dp=3),
     ):
         observe_tensor(
             model.decoder.layers[0],
@@ -443,10 +441,7 @@ def test_observer_reports_expert_output_l2_max_and_mean_by_layer():
     with observer.observe_forward_backward(model=[model], iteration=0, pg_collection=pg_collection):
         for squares in (torch.tensor([9.0, 16.0, 0.0]), torch.tensor([7.0, 9.0, 0.0])):
             observe_tensor(
-                model.decoder.layers[0],
-                "expert_output_squares",
-                "expert_output_squares",
-                squares,
+                model.decoder.layers[0], "expert_output_squares", "expert_output_squares", squares
             )
     observer(
         model=[model], optimizer=_fp32_optimizer(model), iteration=0, pg_collection=pg_collection

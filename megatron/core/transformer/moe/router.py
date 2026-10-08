@@ -809,9 +809,7 @@ class TopKRouter(Router):
 
         if is_observing_tensor("router_topk_probs"):
             with torch.no_grad():
-                observed_probs = probs.detach().view(
-                    seq_length, bsz, self.config.num_moe_experts
-                )
+                observed_probs = probs.detach().view(seq_length, bsz, self.config.num_moe_experts)
                 if padding_mask is not None:
                     observed_probs = observed_probs.masked_fill(
                         padding_mask.view(seq_length, bsz, 1), 0.0
